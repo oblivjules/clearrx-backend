@@ -1,0 +1,34 @@
+# Local environments and secrets
+.env
+.env.*
+!.env.example
+venv/
+.venv/
+
+# Python caches and test coverage
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Model checkpoints and training outputs
+runs/
+checkpoints/
+hf_cache/
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# Local data, databases, and logs
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# OS metadata
+.DS_Store
+Thumbs.db

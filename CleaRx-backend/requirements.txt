@@ -1,0 +1,32 @@
+# ── PyTorch (install first with the correct CUDA build from https://pytorch.org) ──
+# CPU-only:   pip install torch torchvision
+# CUDA 12.8:  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+torch>=2.0.0
+torchvision>=0.15.0
+
+rapidfuzz>=3.6.0
+
+# ── Backend API ────────────────────────────────────────────────────────────────
+fastapi==0.136.1
+uvicorn==0.46.0
+python-multipart==0.0.28
+
+# ── Image processing ───────────────────────────────────────────────────────────
+opencv-python-headless==4.13.0.92
+numpy==2.4.4
+pillow==12.2.0
+
+# ── OCR / ML ───────────────────────────────────────────────────────────────────
+transformers==5.8.1
+sentencepiece==0.2.1
+accelerate==1.13.0
+python-dotenv>=1.0.0
+psycopg2-binary>=2.9.0
+
+
+# OCR & Text Processing
+# Levenshtein is REQUIRED for accurate CER (Character Error Rate) calculation
+# Used in _compute_cer() to measure OCR transcription accuracy against ground truth
+# CER measurement is critical for Objective 2.2 validation (target: CER ≤ 20%)
+#A Library for fast computation of Levenshtein distance and string similarity metrics
+Levenshtein>=0.23.0
