@@ -142,6 +142,27 @@ achievement of post-refactoring outcome targets.
   entrypoint fallback, deterministic parsing and truthful mocked registry writes.
   `git diff --check` passed; private notes are ignored by Git. No live provider
   or database calls, calibration reports or accuracy benchmarks were performed.
+- Commit: `1c2596a` — `feat(ocr): add external recognition with explicit source metadata`.
+
+## B7 — Shadow correction and document previews
+
+- Priorities: #2 preprocessing support and #3 uneven-light image handling.
+- Migrated shadow removal and document-preview methods from the refactored
+  image processor. Corrected pixels feed the existing multi-pass enhancement
+  and both the selected recognizer and genuine local fallback.
+- Success and no-text responses use the document-preview image for display,
+  keeping comparison pixels separate from the multi-pass thresholded image.
+  The existing original-image response remains the perspective-corrected input
+  before shadow correction; registered source files remain unchanged.
+- Existing quality gates, recognition selection and review policy are unchanged.
+- Added generated-image regression checks for geometry, visible stroke contrast,
+  input preservation and pipeline image selection on both recognition paths.
+  These are not new prescription benchmark datasets or clinical accuracy reports.
+- Verification: `python -m pytest tests -q` — 128 passed, 2 skipped
+  (opt-in capture database tests). Generated-image checks cover empty inputs,
+  uniform-light no-op behavior, geometry/contrast/input preservation, and preview
+  versus recognition image selection for provider/local success/no-text paths.
+  `git diff --check` passed. No live database/OCR or accuracy benchmarks were run.
 - Commit: pending explicit user approval.
 
 Run from CleaRx-backend with `python -m pytest tests -q`. Without explicit test

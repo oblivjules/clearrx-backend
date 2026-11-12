@@ -1141,7 +1141,9 @@ async def process_image(
     img, was_corrected = _img_proc.perspective_correct(img)
     detection          = "perspective_corrected" if was_corrected else "frame_region"
 
-    enhanced, readability_confidence, passes_used = _img_proc.enhance_for_handwriting(img)
+    shadow_corrected = await asyncio.to_thread(_img_proc.remove_shadows, img)
+    enhanced, readability_confidence, passes_used = await asyncio.to_thread(
+        _img_proc.enhance_for_handwriting, shadow_corrected)
     preprocessing_id = None
     preprocessing_completed_at = datetime.now(timezone.utc)
     if image_id and _DB_AVAILABLE and not skip_persistence:
@@ -1170,7 +1172,7 @@ async def process_image(
     ocr_started = time.perf_counter()
     logger.info("OCR request_id=%s provider=anthropic model=%s", request_id, selected_model)
     try:
-        recognized = await asyncio.to_thread(run_trocr_ocr, img, model=selected_model)
+        recognized = await asyncio.to_thread(run_trocr_ocr, shadow_corrected, model=selected_model)
     except Exception:
         logger.exception("Recognition provider failed request_id=%s model=%s", request_id, selected_model)
         recognized = None
@@ -1187,7 +1189,7 @@ async def process_image(
     else:
         try:
             from ocr_service import run_trocr as run_local_trocr
-            extracted_text, ocr_confidence = await asyncio.to_thread(run_local_trocr, img)
+            extracted_text, ocr_confidence = await asyncio.to_thread(run_local_trocr, shadow_corrected)
             measured_ocr_confidence = ocr_confidence
             ocr_provider = "trocr-finetuned"
             actual_model = "local-trocr"
@@ -1211,7 +1213,8 @@ async def process_image(
     if not extracted_text or len(extracted_text.strip()) < 4:
         if image_id and _DB_AVAILABLE:
             _db_update_image_status(image_id=image_id, status="rejected")
-        _, buf_enhanced = cv2.imencode(".png", enhanced, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+        display_enhanced = await asyncio.to_thread(_img_proc.create_document_preview, shadow_corrected)
+        _, buf_enhanced = cv2.imencode(".png", display_enhanced, [cv2.IMWRITE_PNG_COMPRESSION, 1])
         _, buf_original = cv2.imencode(".jpg", img,      [cv2.IMWRITE_JPEG_QUALITY, 80])
 
         # ── CER + persist (no_text path) ───────────────────────────────────
@@ -1334,10 +1337,8 @@ async def process_image(
     ocr_conf_pct = round(measured_ocr_confidence * 100) if measured_ocr_confidence is not None else 0
     trocr_label = "OCR confidence unavailable" if measured_ocr_confidence is None else f"OCR heuristic score: {ocr_conf_pct}%"
 
-    _disp_gray  = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    _disp_clahe = cv2.createCLAHE(clipLimit=1.2, tileGridSize=(8, 8))
-    _disp_img   = _disp_clahe.apply(_disp_gray)
-    _, buf_enhanced = cv2.imencode(".png", _disp_img, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+    display_enhanced = await asyncio.to_thread(_img_proc.create_document_preview, shadow_corrected)
+    _, buf_enhanced = cv2.imencode(".png", display_enhanced, [cv2.IMWRITE_PNG_COMPRESSION, 1])
     _, buf_original = cv2.imencode(".jpg", img,       [cv2.IMWRITE_JPEG_QUALITY, 80])
 
     elapsed_ms = round((time.perf_counter() - t_start) * 1000, 1)
