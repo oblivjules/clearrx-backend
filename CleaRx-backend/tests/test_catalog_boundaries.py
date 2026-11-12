@@ -96,7 +96,7 @@ def test_process_emits_catalog_conflicts_without_private_metadata(monkeypatch, c
                          ('check_blur', 'sharp'), ('perspective_correct', (image, False)),
                          ('enhance_for_handwriting', (image, 80, 1))]:
         monkeypatch.setattr(main._img_proc, name, lambda *args, result=result: result)
-    monkeypatch.setattr(main, 'run_trocr_ocr', lambda *args:
+    monkeypatch.setattr(main, 'run_trocr_ocr', lambda *args, **kwargs:
                         ('Example 750mg tablet\nTake 1 tablet twice daily', .95))
     stream = BytesIO()
     Image.new('RGB', (8, 8)).save(stream, 'PNG')
@@ -104,7 +104,7 @@ def test_process_emits_catalog_conflicts_without_private_metadata(monkeypatch, c
     result = asyncio.run(main.process_image(
         Request({'type': 'http', 'headers': []}),
         UploadFile(stream, filename='test.png', headers=Headers({'content-type': 'image/png'})),
-        None, None))
+        None, None, model=main.PRIMARY_OPTION))
     medicine = result['medicines'][0]
     assert result['status'] == 'success'
     assert result['review_required']

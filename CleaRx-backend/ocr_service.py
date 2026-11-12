@@ -382,7 +382,8 @@ class OCRService:
         """
         Accept a BGR (preferred) or grayscale ndarray and return (text, confidence).
 
-        Uses the local fine-tuned checkpoint with a base TrOCR fallback.
+        Runs genuine local TrOCR; the HTTP pipeline uses this when its provider
+        is unavailable. Uses the fine-tuned checkpoint or the base TrOCR model.
         """
         if self._ft_path is not None:
             self._load_ft_model()

@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
 from image_processor import ImageProcessor
-from trocr_service import run_trocr_ocr
+from trocr_service import run_trocr_ocr, resolve_model, PRIMARY_OPTION
 from drug_validator import validate_drug_name, DrugValidator
 from parser import parse_prescription, refresh_drug_catalog, _drug_name_passes_sanity
 from result_policy import extracted_fields, apply_match_review, public_medicine
@@ -285,6 +285,7 @@ def _persist_module_2(
     image_id: str | None,
     preprocessing_id: str | None,
     provider: str,
+    model: str | None = None,
     raw_text: str,
     confidence: float,
     image_shape: tuple[int, ...],
@@ -301,8 +302,8 @@ def _persist_module_2(
         image_id, request_id,
     )
 
-    model_name = provider
-    prefix = "TROCR"
+    model_name = model or provider
+    prefix = "TROCR" if provider == "trocr-finetuned" else "CLAUDE"
     model_id = None
     job_id = None
     try:
@@ -311,15 +312,15 @@ def _persist_module_2(
             model_version=os.getenv(f"{prefix}_MODEL_VERSION", "1"),
             base_model=os.getenv(
                 f"{prefix}_BASE_MODEL",
-                "microsoft/trocr-base-handwritten",
+                "n/a" if provider == "claude-vision" else "microsoft/trocr-base-handwritten",
             ),
             fine_tuned_on=os.getenv(
                 f"{prefix}_FINE_TUNED_ON",
-                "CleaRx prescription dataset",
+                "n/a" if provider == "claude-vision" else "CleaRx prescription dataset",
             ),
             weights_path=os.getenv(
                 f"{prefix}_WEIGHTS_PATH",
-                "runs/trocr-rx/best",
+                "n/a" if provider == "claude-vision" else "runs/trocr-rx/best",
             ),
             status=os.getenv(f"{prefix}_MODEL_STATUS", "active"),
         )
@@ -1054,7 +1055,12 @@ async def process_image(
     file: UploadFile = File(...),
     image_id: str | None = Form(None),
     ground_truth: str | None = Form(None),   # ← QA / CER-only
+    model: str = Form(PRIMARY_OPTION),
 ):
+    try:
+        selected_model, selected_label = resolve_model(model)
+    except ValueError as exc:
+        raise HTTPException(422, "Unsupported recognition option") from exc
     request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
     logger.info(
         "process-image entry image_id=%s request_id=%s",
@@ -1162,16 +1168,43 @@ async def process_image(
         )
 
     ocr_started = time.perf_counter()
-    ocr_provider = "trocr-finetuned"
+    logger.info("OCR request_id=%s provider=anthropic model=%s", request_id, selected_model)
     try:
-        extracted_text, ocr_confidence = run_trocr_ocr(img)
+        recognized = await asyncio.to_thread(run_trocr_ocr, img, model=selected_model)
+    except Exception:
+        logger.exception("Recognition provider failed request_id=%s model=%s", request_id, selected_model)
+        recognized = None
+    if recognized is not None:
+        extracted_text, provider_confidence = recognized
+        # Legacy NOT NULL storage needs a neutral placeholder, not a probability.
+        ocr_confidence = provider_confidence if provider_confidence is not None else 0.5
+        measured_ocr_confidence = None
+        ocr_provider = "claude-vision"
+        actual_model = selected_model
+        public_source = selected_label
         ocr_error = None
         ocr_failure_reason = None
-    except Exception as exc:
-        extracted_text = ""
-        ocr_confidence = 0.0
-        ocr_error = str(exc)
-        ocr_failure_reason = str(exc)
+    else:
+        try:
+            from ocr_service import run_trocr as run_local_trocr
+            extracted_text, ocr_confidence = await asyncio.to_thread(run_local_trocr, img)
+            measured_ocr_confidence = ocr_confidence
+            ocr_provider = "trocr-finetuned"
+            actual_model = "local-trocr"
+            public_source = "Local TrOCR"
+            ocr_error = "Recognition service unavailable; local TrOCR fallback used"
+            ocr_failure_reason = None
+            logger.info("OCR request_id=%s provider=local model=local-trocr", request_id)
+        except Exception as exc:
+            logger.exception("Local OCR failed request_id=%s", request_id)
+            extracted_text = ""
+            ocr_confidence = 0.0
+            measured_ocr_confidence = None
+            ocr_provider = "trocr-finetuned"
+            actual_model = "local-trocr"
+            public_source = "Unavailable"
+            ocr_error = "Recognition is unavailable; please try again"
+            ocr_failure_reason = type(exc).__name__
 
     ocr_elapsed_ms = round((time.perf_counter() - ocr_started) * 1000, 1)
 
@@ -1208,6 +1241,7 @@ async def process_image(
                     image_id=image_id,
                     preprocessing_id=preprocessing_id,
                     provider=ocr_provider,
+                    model=actual_model,
                     raw_text=extracted_text or "",
                     confidence=ocr_confidence,
                     image_shape=img.shape,
@@ -1229,7 +1263,9 @@ async def process_image(
             "quality_score":      readability_confidence,
             "trocr_confidence":   0,
             "trocr_label":        "No text",
-            "ocr_source":         ocr_provider,
+            "ocr_source":         public_source,
+            "ocr_confidence":     measured_ocr_confidence,
+            "ocr_confidence_basis": "unavailable" if measured_ocr_confidence is None else "uncalibrated_heuristic",
             "passes_used":        passes_used,
             "processing_time_ms": round((time.perf_counter() - t_start) * 1000, 1),
             "cer":                cer_result,
@@ -1262,7 +1298,7 @@ async def process_image(
             m["drug_name"] = None
             m["uncertain"] = True
 
-    ocr_source = ocr_provider
+    ocr_source = public_source
 
     drug_validations = []
     for medicine_index, m in enumerate(medicines):
@@ -1295,8 +1331,8 @@ async def process_image(
     else:
         drug_validation = {"original": "", "corrected": "", "confidence": 0.0, "matched": False}
 
-    ocr_conf_pct = round(ocr_confidence * 100)
-    trocr_label  = f"{ocr_conf_pct}%"
+    ocr_conf_pct = round(measured_ocr_confidence * 100) if measured_ocr_confidence is not None else 0
+    trocr_label = "OCR confidence unavailable" if measured_ocr_confidence is None else f"OCR heuristic score: {ocr_conf_pct}%"
 
     _disp_gray  = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     _disp_clahe = cv2.createCLAHE(clipLimit=1.2, tileGridSize=(8, 8))
@@ -1323,6 +1359,7 @@ async def process_image(
                 image_id=image_id,
                 preprocessing_id=preprocessing_id,
                 provider=ocr_provider,
+                model=actual_model,
                 raw_text=extracted_text,
                 confidence=ocr_confidence,
                 image_shape=img.shape,
@@ -1392,6 +1429,8 @@ async def process_image(
         "name_similarity":    drug_validation.get("raw_score"),
         "review_required":    any(m.get("review_required") or m.get("uncertain") for m in medicines),
         "ocr_source":         ocr_source,
+        "ocr_confidence":     measured_ocr_confidence,
+        "ocr_confidence_basis": "unavailable" if measured_ocr_confidence is None else "uncalibrated_heuristic",
         "cer":                cer_result,
         **({"ocr_error": ocr_error} if ocr_error else {}),
     }

@@ -116,6 +116,32 @@ achievement of post-refactoring outcome targets.
   conditions and real checks on generated images, all six image endpoint byte
   limits, supported formats, MIME/pixel limits, storage cleanup and retrieval
   containment. `git diff --check` passed. No real database or OCR calls were made.
+- Commit: `9cfdc4f` — `feat(capture): validate and store uploaded prescription images`.
+
+## B6 — Recognition options and explicit source metadata
+
+- Priorities: #2 recognition integration and #4 truthful confidence/review data.
+- Added the provider recognition adapter/SDK dependency and per-request selection.
+  Public names are CleaRx TrOCR and Claude Sonnet 5.5. The user confirmed retaining
+  the existing primary engine; accurate technical mapping lives in code,
+  diagnostics, model-registry records and ignored local implementation notes.
+- Retained selected-provider-first behavior with genuine local TrOCR on provider
+  unavailability. Local and unavailable results have distinct public sources.
+  The local service does not recursively call the provider. No local-first
+  confidence-gated architecture was introduced.
+- Kept deterministic parsing for both sources; the unused provider-based
+  structured parser was not migrated. Review flags remain unchanged.
+- Unknown provider confidence is null in API results; numeric legacy storage uses
+  a documented placeholder. Cloud model records do not claim local weights or
+  fine-tuning. Provider errors do not expose internal engine IDs in API details.
+- Added public option/retention documentation and ignored `.private/` technical
+  notes. No masking, deletion or provider retention guarantees are claimed.
+- Verification: `python -m pytest tests -q` — 117 passed, 2 skipped
+  (opt-in capture database tests). Includes option/model routing, unavailable
+  confidence, public labels/internal diagnostics, bounded retries, genuine-local
+  entrypoint fallback, deterministic parsing and truthful mocked registry writes.
+  `git diff --check` passed; private notes are ignored by Git. No live provider
+  or database calls, calibration reports or accuracy benchmarks were performed.
 - Commit: pending explicit user approval.
 
 Run from CleaRx-backend with `python -m pytest tests -q`. Without explicit test
