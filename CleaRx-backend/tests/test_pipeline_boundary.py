@@ -24,7 +24,7 @@ def test_process_returns_unknown_ocr_confidence_and_cutoff_review(monkeypatch):
     stream.seek(0)
     upload = UploadFile(stream, filename='test.png', headers=Headers({'content-type': 'image/png'}))
     request = Request({'type': 'http', 'headers': []})
-    result = asyncio.run(main.process_image(request, upload, None, None, main.PRIMARY_OPTION))
+    result = asyncio.run(main.process_image(request, upload, None, None, "claude-sonnet-5-5"))
     assert result['status'] == 'success'
     assert result['ocr_confidence'] is None
     assert result['ocr_confidence_basis'] == 'unavailable'

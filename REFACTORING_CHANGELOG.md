@@ -196,3 +196,22 @@ achievement of post-refactoring outcome targets.
 Run from CleaRx-backend with `python -m pytest tests -q`. Without explicit test
 database configuration, capture integration tests skip. Never configure these
 write tests against an application or production database.
+
+## Post-migration - Explicit local primary recognition
+
+- Separate from B1-B8: user approved genuine local TrOCR for the CleaRx TrOCR
+  primary option. Remove the provider-backed primary configuration and retired
+  option aliases. Preserve the explicit Claude Sonnet 5.5 external option and
+  its existing local fallback; primary failure never calls an external provider.
+- Add explicit base/checkpoint configuration and truthful model-registry metadata.
+  Stop logging local OCR line content. Historical migration entries above remain
+  evidence of the earlier architecture, not current routing instructions.
+- Verification: `python -m pytest CleaRx-backend/tests -q` passed with 146 tests
+  and 2 skipped disposable-database tests. Includes local-only primary/no remote
+  fallback on primary failure, explicit external routing/local fallback, missing
+  checkpoint errors, truthful metadata and existing image/parser/catalog/locking
+  regressions. Provider and local inference were mocked; no live model downloads,
+  provider calls or application database writes were performed.
+- User approved this focused commit after reporting successful Android verification.
+- Commit: approved as `fix(ocr): use explicit local primary recognition`.
+- No push, merge or deployment performed.

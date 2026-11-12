@@ -28,8 +28,6 @@ def pipeline(monkeypatch):
 
 
 @pytest.mark.parametrize('option,engine,label', [
-    ('clearx-trocr', 'claude-sonnet-4-6', 'CleaRx TrOCR'),
-    ('claude-sonnet-4-6', 'claude-sonnet-4-6', 'CleaRx TrOCR'),
     ('claude-sonnet-5-5', 'claude-sonnet-5-5', 'Claude Sonnet 5.5'),
 ])
 def test_sources_are_public_but_logs_record_actual_provider(monkeypatch, pipeline, caplog, option, engine, label):
@@ -49,7 +47,7 @@ def test_sources_are_public_but_logs_record_actual_provider(monkeypatch, pipelin
     assert 'cutoff_text' in body['medicines'][0]['review_reasons']
     assert recognize.call_args.kwargs['model'] == engine
     assert 'provider=anthropic' in caplog.text and engine in caplog.text
-    assert 'claude-sonnet-4-6' not in response.text
+    assert 'local-trocr' not in response.text
 
 
 def test_unknown_option_fails_before_provider(monkeypatch, pipeline):
@@ -69,7 +67,7 @@ def test_provider_outage_uses_genuine_local_entrypoint(monkeypatch, pipeline, fa
         return_value=('Amoxicillin 500mg tablet\nTake 1 tablet twice daily', .8))
     monkeypatch.setitem(sys.modules, 'ocr_service', SimpleNamespace(run_trocr=local))
     client, files = pipeline
-    response = client.post('/process-image', files=files)
+    response = client.post('/process-image', files=files, data={'model': 'claude-sonnet-5-5'})
     assert response.status_code == 200
     body = response.json()
     local.assert_called_once()
@@ -80,9 +78,8 @@ def test_provider_outage_uses_genuine_local_entrypoint(monkeypatch, pipeline, fa
 
 
 @pytest.mark.parametrize('provider,model,base', [
-    ('claude-vision', 'claude-sonnet-4-6', 'n/a'),
     ('claude-vision', 'claude-sonnet-5-5', 'n/a'),
-    ('trocr-finetuned', 'local-trocr', 'microsoft/trocr-base-handwritten'),
+    ('trocr-local', 'local-trocr', 'microsoft/trocr-base-handwritten'),
 ])
 def test_registry_records_actual_engine_without_fabricated_training(monkeypatch, provider, model, base):
     monkeypatch.setattr(main, '_DB_AVAILABLE', True)
@@ -99,3 +96,34 @@ def test_registry_records_actual_engine_without_fabricated_training(monkeypatch,
     if provider == 'claude-vision':
         assert registry.call_args.kwargs['fine_tuned_on'] == 'n/a'
         assert registry.call_args.kwargs['weights_path'] == 'n/a'
+
+
+def test_primary_option_uses_local_only_without_provider_credentials(monkeypatch, pipeline, caplog):
+    remote = Mock(side_effect=AssertionError("primary must not call a provider"))
+    local = Mock(return_value=("Amoxicillin 500mg tablet\nTake 1 tablet twice daily", .8))
+    monkeypatch.setattr(main, "run_trocr_ocr", remote)
+    monkeypatch.setitem(sys.modules, "ocr_service", SimpleNamespace(run_trocr=local))
+    caplog.set_level("INFO", logger="main")
+    client, files = pipeline
+    response = client.post("/process-image", files=files)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["ocr_source"] == "CleaRx TrOCR"
+    assert body["ocr_confidence"] == .8
+    assert body["ocr_confidence_basis"] == "uncalibrated_heuristic"
+    assert "ocr_error" not in body
+    assert "provider=local" in caplog.text
+    local.assert_called_once()
+    remote.assert_not_called()
+
+
+def test_primary_failure_does_not_silently_send_to_external_provider(monkeypatch, pipeline):
+    remote = Mock()
+    monkeypatch.setattr(main, "run_trocr_ocr", remote)
+    monkeypatch.setitem(sys.modules, "ocr_service", SimpleNamespace(run_trocr=Mock(side_effect=RuntimeError("missing weights"))))
+    client, files = pipeline
+    response = client.post("/process-image", files=files, data={"model": "clearx-trocr"})
+    assert response.status_code == 200
+    assert response.json()["ocr_source"] == "Unavailable"
+    assert response.json()["status"] == "rejected"
+    remote.assert_not_called()

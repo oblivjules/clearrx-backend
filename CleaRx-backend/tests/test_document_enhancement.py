@@ -75,7 +75,7 @@ def test_pipeline_uses_corrected_pixels_but_returns_separate_comparison_images(m
     Image.new('RGB', (16, 16), (60, 60, 60)).save(stream, 'PNG')
     client = TestClient(main.app)
     try:
-        response = client.post('/process-image', files={'file': ('image.png', stream.getvalue(), 'image/png')})
+        response = client.post('/process-image', files={'file': ('image.png', stream.getvalue(), 'image/png')}, data={'model': 'claude-sonnet-5-5'})
     finally:
         client.close()
     assert response.status_code == 200, response.text

@@ -16,7 +16,7 @@ import numpy as np
 
 _ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
 
-_MODEL = "claude-sonnet-4-6"
+LOCAL_MODEL = "local-trocr"
 PRIMARY_OPTION = "clearx-trocr"
 PRIMARY_LABEL = "CleaRx TrOCR"
 EXTERNAL_MODEL = "claude-sonnet-5-5"
@@ -24,15 +24,13 @@ EXTERNAL_LABEL = "Claude Sonnet 5.5"
 
 
 def resolve_model(option: str) -> tuple[str, str]:
-    # Accept the legacy internal primary ID for older clients during migration.
-    if option in {PRIMARY_OPTION, _MODEL}:
-        return _MODEL, PRIMARY_LABEL
+    if option == PRIMARY_OPTION:
+        return LOCAL_MODEL, PRIMARY_LABEL
     if option == EXTERNAL_MODEL:
         return EXTERNAL_MODEL, EXTERNAL_LABEL
     raise ValueError("Unsupported recognition option")
 
 SUPPORTED_MODELS = {
-    _MODEL: "Claude Sonnet 4.6",
     "claude-sonnet-5-5": "Claude Sonnet 5.5",
 }
 
@@ -67,7 +65,7 @@ def _init() -> bool:
         return False
 
 
-def _message_with_retry(system: str, messages: list[dict], model: str = _MODEL) -> str | None:
+def _message_with_retry(system: str, messages: list[dict], model: str = EXTERNAL_MODEL) -> str | None:
     """
     Call _client.messages.create with exponential backoff on 429.
     Returns the response text, or None on persistent failure.
@@ -153,7 +151,7 @@ _OCR_PROMPT = (
 )
 
 
-def run_trocr_ocr(image: np.ndarray, model: str = _MODEL) -> tuple[str, float | None] | None:
+def run_trocr_ocr(image: np.ndarray, model: str = EXTERNAL_MODEL) -> tuple[str, float | None] | None:
     """
     Send a BGR/grayscale prescription image to Claude Vision.
 

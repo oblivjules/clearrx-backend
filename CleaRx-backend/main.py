@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
 from image_processor import ImageProcessor
-from trocr_service import run_trocr_ocr, resolve_model, PRIMARY_OPTION
+from trocr_service import run_trocr_ocr, resolve_model, PRIMARY_OPTION, LOCAL_MODEL
 from drug_validator import validate_drug_name, DrugValidator
 from parser import parse_prescription, refresh_drug_catalog, _drug_name_passes_sanity
 from result_policy import extracted_fields, apply_match_review, public_medicine
@@ -304,26 +304,19 @@ def _persist_module_2(
     )
 
     model_name = model or provider
-    prefix = "TROCR" if provider == "trocr-finetuned" else "CLAUDE"
     model_id = None
     job_id = None
     try:
+        if provider == "claude-vision":
+            metadata = dict(base_model="n/a", fine_tuned_on="n/a", weights_path="n/a")
+            version = os.getenv("CLAUDE_MODEL_VERSION", "1")
+        else:
+            from recognition_config import local_model_configuration
+            metadata = local_model_configuration()
+            version = os.getenv("TROCR_MODEL_VERSION", "1")
         model_id = _db_get_or_create_trocr_model(
-            model_name=model_name,
-            model_version=os.getenv(f"{prefix}_MODEL_VERSION", "1"),
-            base_model=os.getenv(
-                f"{prefix}_BASE_MODEL",
-                "n/a" if provider == "claude-vision" else "microsoft/trocr-base-handwritten",
-            ),
-            fine_tuned_on=os.getenv(
-                f"{prefix}_FINE_TUNED_ON",
-                "n/a" if provider == "claude-vision" else "CleaRx prescription dataset",
-            ),
-            weights_path=os.getenv(
-                f"{prefix}_WEIGHTS_PATH",
-                "n/a" if provider == "claude-vision" else "runs/trocr-rx/best",
-            ),
-            status=os.getenv(f"{prefix}_MODEL_STATUS", "active"),
+            model_name=model_name, model_version=version,
+            **metadata, status="active",
         )
     except Exception as exc:
         logger.error("trocr_model_registry failed (image_id=%s, step=model): %s", image_id, exc)
@@ -1189,12 +1182,13 @@ async def _process_image(
 
     preprocessing_ms = round((time.perf_counter() - t_start) * 1000, 1)
     ocr_started = time.perf_counter()
-    logger.info("OCR request_id=%s provider=anthropic model=%s", request_id, selected_model)
-    try:
-        recognized = await asyncio.to_thread(run_trocr_ocr, shadow_corrected, model=selected_model)
-    except Exception:
-        logger.exception("Recognition provider failed request_id=%s model=%s", request_id, selected_model)
-        recognized = None
+    recognized = None
+    if selected_model != LOCAL_MODEL:
+        logger.info("OCR request_id=%s provider=anthropic model=%s", request_id, selected_model)
+        try:
+            recognized = await asyncio.to_thread(run_trocr_ocr, shadow_corrected, model=selected_model)
+        except Exception:
+            logger.exception("Recognition provider failed request_id=%s model=%s", request_id, selected_model)
     if recognized is not None:
         extracted_text, provider_confidence = recognized
         # Legacy NOT NULL storage needs a neutral placeholder, not a probability.
@@ -1210,10 +1204,10 @@ async def _process_image(
             from ocr_service import run_trocr as run_local_trocr
             extracted_text, ocr_confidence = await asyncio.to_thread(run_local_trocr, shadow_corrected)
             measured_ocr_confidence = ocr_confidence
-            ocr_provider = "trocr-finetuned"
+            ocr_provider = "trocr-local"
             actual_model = "local-trocr"
-            public_source = "Local TrOCR"
-            ocr_error = "Recognition service unavailable; local TrOCR fallback used"
+            public_source = selected_label if selected_model == LOCAL_MODEL else "Local TrOCR"
+            ocr_error = None if selected_model == LOCAL_MODEL else "Recognition service unavailable; local TrOCR fallback used"
             ocr_failure_reason = None
             logger.info("OCR request_id=%s provider=local model=local-trocr", request_id)
         except Exception as exc:
@@ -1221,7 +1215,7 @@ async def _process_image(
             extracted_text = ""
             ocr_confidence = 0.0
             measured_ocr_confidence = None
-            ocr_provider = "trocr-finetuned"
+            ocr_provider = "trocr-local"
             actual_model = "local-trocr"
             public_source = "Unavailable"
             ocr_error = "Recognition is unavailable; please try again"

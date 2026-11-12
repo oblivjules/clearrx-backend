@@ -8,8 +8,6 @@ import trocr_service as service
 
 
 @pytest.mark.parametrize('option,engine,label', [
-    ('clearx-trocr', 'claude-sonnet-4-6', 'CleaRx TrOCR'),
-    ('claude-sonnet-4-6', 'claude-sonnet-4-6', 'CleaRx TrOCR'),
     ('claude-sonnet-5-5', 'claude-sonnet-5-5', 'Claude Sonnet 5.5'),
 ])
 def test_options_route_to_configured_engine(monkeypatch, option, engine, label):
@@ -37,7 +35,7 @@ def test_default_model_and_missing_provider_confidence(monkeypatch):
     create = Mock(return_value=SimpleNamespace(content=[SimpleNamespace(type='text', text='Amoxicillin')]))
     monkeypatch.setattr(service, '_client', SimpleNamespace(messages=SimpleNamespace(create=create)))
     assert service.run_trocr_ocr(np.zeros((8, 8, 3), dtype=np.uint8)) == ('Amoxicillin', None)
-    assert create.call_args.kwargs['model'] == 'claude-sonnet-4-6'
+    assert create.call_args.kwargs['model'] == 'claude-sonnet-5-5'
 
 
 def test_retry_backoff_is_bounded(monkeypatch):

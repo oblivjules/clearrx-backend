@@ -104,7 +104,7 @@ def test_process_emits_catalog_conflicts_without_private_metadata(monkeypatch, c
     result = asyncio.run(main.process_image(
         Request({'type': 'http', 'headers': []}),
         UploadFile(stream, filename='test.png', headers=Headers({'content-type': 'image/png'})),
-        None, None, model=main.PRIMARY_OPTION))
+        None, None, model="claude-sonnet-5-5"))
     medicine = result['medicines'][0]
     assert result['status'] == 'success'
     assert result['review_required']

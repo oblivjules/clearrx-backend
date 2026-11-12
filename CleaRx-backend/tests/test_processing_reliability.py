@@ -40,7 +40,7 @@ def test_duplicates_and_checksum_mismatches_do_not_spend_ocr(monkeypatch, comple
     client = TestClient(main.app)
     try:
         response = client.post('/process-image', files={'file': ('test.png', stream.getvalue(), 'image/png')},
-                               data={'image_id': IMAGE_ID})
+                               data={'image_id': IMAGE_ID, 'model': 'claude-sonnet-5-5'})
     finally:
         client.close()
     assert response.status_code == expected
@@ -81,7 +81,7 @@ def test_completion_status_follows_required_writes(monkeypatch, saved, status_fa
     client = TestClient(main.app)
     try:
         response = client.post('/process-image', files={'file': ('test.png', stream.getvalue(), 'image/png')},
-                               data={'image_id': IMAGE_ID})
+                               data={'image_id': IMAGE_ID, 'model': 'claude-sonnet-5-5'})
     finally:
         client.close()
     assert response.status_code == 200, response.text

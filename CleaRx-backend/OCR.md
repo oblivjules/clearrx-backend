@@ -1,24 +1,43 @@
 # Recognition options — Priority #2
 
-The API offers **CleaRx TrOCR** as its primary recognition option and
-**Claude Sonnet 5.5** as its external option. Both may process prescription images
-through a third-party AI service. The primary name is a product label, not a
-guarantee of offline processing or evidence that a local TrOCR model executed.
+The API offers **CleaRx TrOCR** as genuine local recognition on the backend and
+**Claude Sonnet 5.5** as the explicitly selected external option. This changes
+the previously provider-backed primary option following the user's approval.
+It is not an automatic confidence-gated hybrid.
 
-`POST /process-image` accepts the existing multipart image/registration fields
-and an optional `model` field:
+`POST /process-image` accepts existing multipart image/registration fields and
+an optional `model` field:
 
-| Value | Public name |
-| --- | --- |
-| `clearx-trocr` (default) | CleaRx TrOCR |
-| `claude-sonnet-5-5` | Claude Sonnet 5.5 |
+| Value | Public name | Engine |
+| --- | --- | --- |
+| `clearx-trocr` (default) | CleaRx TrOCR | Local TrOCR |
+| `claude-sonnet-5-5` | Claude Sonnet 5.5 | External vision service |
 
-Older clients' primary option is accepted for migration compatibility. Unsupported
-options return 422 before recognition. If the selected service is unavailable,
-the backend attempts genuine local TrOCR and reports **Local TrOCR** when used.
-Failure of both paths returns a no-text rejection with recovery guidance.
-The same deterministic parser, catalog matcher and review policy process every
-source. No switch to a local-first confidence-gated architecture is introduced.
+Only these public identifiers are accepted. Removed provider aliases return 422;
+clients using the documented primary identifier remain compatible. Local primary
+failure returns an unavailable/no-text result without sending the image to a
+provider. If the explicitly selected external option fails, the existing genuine
+local fallback is retained and reported as **Local TrOCR**. All sources use the
+same deterministic parser, catalog matcher and review policy.
+
+## Local engine configuration
+
+`TROCR_BASE_MODEL` defaults explicitly to `microsoft/trocr-base-handwritten`.
+`TROCR_CHECKPOINT_DIR` may select a local TrOCR-compatible checkpoint directory;
+a missing explicit directory is an error, not a silent model substitution.
+Without this override, existing `runs/trocr-rx/best` or
+`runs/trocr-rx/checkpoint-epoch-20` checkpoints are detected in that order;
+otherwise the configured base model is used. Existing line-level base-model
+fallback inside the local pipeline remains unchanged. Registry metadata records
+configured checkpoint/base paths and does not invent training-dataset attribution.
+
+Model artifacts/dependencies must be available to the backend before use. First
+use may download base-model artifacts; provision/cache them before deployment.
+No actual model download or inference was performed by the mocked regressions.
+The external option still requires server-side `ANTHROPIC_API_KEY` credentials.
+Its configured provider identifier is `claude-sonnet-5-5`, as listed in the
+[provider documentation](https://platform.claude.com/docs/en/models/sonnet-5-5/overview).
+Account access and live inference remain unverified.
 
 ## Confidence and provenance
 
