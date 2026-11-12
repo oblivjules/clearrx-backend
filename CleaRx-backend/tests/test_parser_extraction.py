@@ -136,7 +136,8 @@ def test_per_field_uncertainty_flags_do_not_copy_line_flag():
     )
     medicine = parse_prescription(text, ocr_confidence=0.9)[0]
 
-    assert medicine["uncertain"] is False
+    # The card requires review, but the warning remains scoped to timing.
+    assert medicine["uncertain"] is True
     assert medicine["uncertain_fields"] == ["timing"]
 
 

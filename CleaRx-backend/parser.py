@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from fractions import Fraction
+
 import re
 import logging
 from rapidfuzz import fuzz, process
@@ -77,7 +79,8 @@ class PrescriptionParser:
         re.IGNORECASE,
     )
     _CONTINUATION_START_RE = re.compile(
-        r'^\s*(?:sig|sg|s|disp|qty|quantity|#)\b',
+        r'^\s*(?:sig|sg|s|disp|qty|quantity|#|take|give|apply|use|'
+        r'instill|inject|dissolve|swallow|chew|administer|rinse|gargle)\b',
         re.IGNORECASE,
     )
 
@@ -344,7 +347,7 @@ class PrescriptionParser:
                 r'gel|drops?)\b', re.IGNORECASE,
             ),
             "dose_amount": re.compile(
-                r'\b[1-9]\d*(?:/\d+)?\s*(?:tab(?:let)?s?|cap(?:sule)?s?|'
+                r'(?<![\w./])(?:[1-9]\d*|0)(?:\.\d+)?(?:/\d+)?\s*(?:tab(?:let)?s?|cap(?:sule)?s?|'
                 r'drop[s]?|puff[s]?)\b', re.IGNORECASE,
             ),
             "frequency": re.compile(
@@ -554,7 +557,7 @@ class PrescriptionParser:
 
     def _extract_dose_amount(self, text: str) -> str | None:
         match = re.search(
-            r'\b([1-9]\d*(?:/\d+)?)\s*(tab(?:let)?s?|cap(?:sule)?s?|drop[s]?|puff[s]?)\b',
+            r'(?<![\w./])((?:[1-9]\d*|0)(?:\.\d+)?(?:/\d+)?)\s*(tab(?:let)?s?|cap(?:sule)?s?|drop[s]?|puff[s]?)\b',
             text, re.IGNORECASE,
         )
         if not match:
@@ -625,6 +628,9 @@ class PrescriptionParser:
         return self._DRUG_DETECT_THRESHOLD
 
     def _spell_correct_drug(self, candidate: str) -> str:
+        if _DrugValidator._product_catalog is not None:
+            result = _DrugValidator._product_catalog.match(candidate)
+            return result['corrected'] if result['matched'] else candidate
         if len(candidate) < 4:
             return candidate
         lower = candidate.lower().strip()
@@ -682,6 +688,15 @@ class PrescriptionParser:
         return corrected
 
     def _detect_drug_in_line(self, line: str) -> tuple[str, str, bool] | None:
+        catalog = _DrugValidator._product_catalog
+        if catalog is not None:
+            result = catalog.match(line)
+            if result['matched']:
+                is_brand = line.lower().strip() in self._BRAND_TO_GENERIC
+                return (line, result['corrected'], is_brand)
+            # Preserve unmatched OCR for review rather than applying a second,
+            # differently scored correction before the catalog sees it.
+            return None
         lower = line.lower()
         ocr_corrected_lower = ' '.join(self._ocr_correct_token(w) for w in lower.split())
         for brand, generic in self._BRAND_TO_GENERIC.items():
@@ -749,8 +764,23 @@ class PrescriptionParser:
             and self._extract_quantity(line) is None
         )
 
+    def _leading_catalog_brand(self, line: str) -> str | None:
+        # Preserve strength-like digits that belong to a registered brand name.
+        words = line.split()
+        for count in range(min(len(words), 12), 0, -1):
+            candidate = ' '.join(words[:count]).strip(' ,:;')
+            if candidate.lower() in self._BRAND_TO_GENERIC:
+                return candidate
+        return None
+
     def _drug_name_part(self, line: str) -> str:
         """Return only the name-bearing portion before strength/form/quantity."""
+        line = re.sub(r'^\s*\d+\s*[.)]\s*', '', line)
+        line = re.sub(r'\[(?:UNCERTAIN|CUTOFF)\]', ' ', line)
+        line = re.sub(r'\(\s*\)', ' ', line)
+        catalog_brand = self._leading_catalog_brand(line)
+        if catalog_brand:
+            return catalog_brand
         name_part = re.split(r'\b(?:sig|sg|disp)\b|#\s*\d+|'
                              r'\b(?:qty|quantity)\.?\s*:?\s*\d+', line,
                              maxsplit=1, flags=re.IGNORECASE)[0]
@@ -781,7 +811,8 @@ class PrescriptionParser:
 
     def _line_has_medicine_evidence(self, line: str) -> bool:
         return bool(
-            self._DOSAGE_RE.search(line)
+            self._leading_catalog_brand(line)
+            or self._DOSAGE_RE.search(line)
             or re.search(
                 r'\b(?:tab(?:let)?s?|cap(?:sule)?s?|syrup|susp(?:ension)?|'
                 r'solution|soln|cream|ointment|gel|drops?)\b',
@@ -839,20 +870,31 @@ class PrescriptionParser:
         strength = self._extract_strength(combined_text)
         dosage_form = self._extract_dosage_form(combined_text)
         dose_amount = self._extract_dose_amount(combined_text)
+        invalid_dose = False
+        if dose_amount:
+            try:
+                invalid_dose = Fraction(dose_amount.split()[0]) <= 0
+            except (ValueError, ZeroDivisionError):
+                invalid_dose = True
         timing = self._extract_timing(combined_text)
         administration_instructions = self._extract_administration_instructions(combined_text)
         uncertain_fields = ["timing"] if timing and self._timing_is_uncertain(combined_text) else []
+        route_source = "stated" if route else None
         route = self._default_route(route, dosage_form)
+        if route and route_source is None:
+            route_source = "inferred"
         duration_source = "stated" if duration else None
-        if duration and quantity and re.search(r'#\s*' + re.escape(quantity), combined_text):
-            duration = None
-            duration_source = None
         if duration is None and quantity and dose_amount and frequency:
             daily_doses = self._FREQ_DAILY_DOSES.get(frequency)
-            dose_match = re.match(r'(\d+)', dose_amount)
-            if daily_doses and dose_match:
-                days_value = int(quantity) / (int(dose_match.group(1)) * daily_doses)
-                if days_value.is_integer() and days_value >= 1:
+            dose_match = re.fullmatch(r'(\d+(?:\.\d+)?(?:/\d+)?)\s+(tablet|tab|capsule|cap)', dose_amount)
+            variable_schedule = re.search(r'\b(?:prn|as needed|taper|then|every other|alternate)\b', combined_text, re.I)
+            if daily_doses and dose_match and not variable_schedule:
+                try:
+                    dose_units = Fraction(dose_match.group(1))
+                    days_value = Fraction(int(quantity)) / (dose_units * daily_doses)
+                except (ValueError, ZeroDivisionError):
+                    days_value = Fraction(0)
+                if days_value.denominator == 1 and days_value >= 1:
                     duration = f"{int(days_value)} days"
                     duration_source = "derived"
 
@@ -885,6 +927,18 @@ class PrescriptionParser:
                 self._field_source_match(combined_text, name, str(value)),
             )
         }
+        original_name = drug_name_raw or brand_substring or drug_name
+        if original_name and self._followed_by_uncertain(
+            combined_text, re.search(re.escape(original_name), combined_text, re.I)
+        ):
+            marker_fields.add('drug_name')
+        cutoff = '[CUTOFF]' in combined_text
+        if invalid_dose:
+            marker_fields.add('dose_amount')
+        if cutoff:
+            # Truncation may hide fields completely; flag the line even if the
+            # exact missing field cannot be identified from surviving text.
+            marker_fields.add('administration_instructions')
         field_flags = {
             name: bool(value) and (
                 ocr_confidence < 0.45
@@ -908,6 +962,9 @@ class PrescriptionParser:
             name for name, value in field_values.items()
             if value and field_flags.get(name, False)
         ]
+        if cutoff and 'administration_instructions' not in uncertain_fields:
+            uncertain_fields.append('administration_instructions')
+        uncertain = uncertain or bool(uncertain_fields)
 
         return {
             "brand_name":              brand_substring if is_brand else None,
@@ -926,6 +983,8 @@ class PrescriptionParser:
             "timing":                  timing,
             "administration_instructions": administration_instructions,
             "duration_source":         duration_source,
+            "route_source":            route_source,
+            "review_reasons":          (["cutoff_text"] if cutoff else []) + (["invalid_dose_amount"] if invalid_dose else []),
             "uncertain_fields":         uncertain_fields,
             "drug_name_raw":            drug_name_raw or brand_substring or drug_name or None,
             "_drug_name_raw":           drug_name_raw or brand_substring or drug_name or None,
@@ -938,7 +997,11 @@ class PrescriptionParser:
         raw_text: str,
         ocr_confidence: float = 1.0,
     ) -> list[dict[str, str | None]]:
-        lines = [self._normalize(line) for line in raw_text.splitlines()]
+        # Canonicalize case before interpreting markers; keep them until flags exist.
+        marked_text = re.sub(r'\[\s*(UNCERTAIN|CUTOFF)\s*\]',
+                             lambda match: '[' + match.group(1).upper() + ']',
+                             raw_text, flags=re.IGNORECASE)
+        lines = [self._normalize(line) for line in marked_text.splitlines()]
         lines = [l for l in lines if l]
 
         _empty = [{"brand_name": None, "drug_name": None, "dosage": None,
@@ -964,13 +1027,22 @@ class PrescriptionParser:
             is_continuation = self._is_continuation_line(line)
             detected = None
             if not is_continuation and self._line_has_medicine_evidence(line):
-                detected = self._detect_drug_in_line(self._drug_name_part(line))
+                raw_name = self._drug_name_part(line)
+                detected = self._detect_drug_in_line(raw_name)
+                # A catalog miss is still a separate medicine candidate. Keep
+                # its OCR name for review instead of attaching its directions
+                # to the preceding matched medicine. Strength/quantity-only
+                # continuation lines must stay with their existing block.
+                if not detected and re.search(r'[A-Za-z]{3,}', raw_name) and not self._is_non_drug_candidate(raw_name):
+                    detected = (raw_name, "", False)
             if detected:
                 if current_generic is not None:
                     blocks.append((current_generic, current_brand_sub,
                                    current_is_brand, current_score, current_lines))
                 matched_sub, generic, is_brand = detected
-                if is_brand:
+                if not generic:
+                    score = 0.0
+                elif is_brand:
                     score = 1.0
                 else:
                     r = process.extractOne(

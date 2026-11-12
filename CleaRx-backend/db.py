@@ -2,17 +2,39 @@ from __future__ import annotations
 
 import os
 import hashlib
+import threading
 from datetime import datetime, timezone
 from contextlib import contextmanager
 
 import psycopg2
 from psycopg2.extras import execute_values
+from psycopg2.pool import ThreadedConnectionPool
 
 
 class DatabaseService:
+    def __init__(self, connection_factory=None):
+        self._connection_factory = connection_factory
+        self._pool = None
+        self._pool_lock = threading.Lock()
+
+    def _connection_pool(self):
+        with self._pool_lock:
+            if self._pool is None:
+                self._pool = ThreadedConnectionPool(
+                    1, max(4, int(os.getenv('DB_POOL_SIZE', '8'))),
+                    dsn=os.getenv('DATABASE_URL'), sslmode='require', connect_timeout=10)
+        return self._pool
+
+    def close(self):
+        with self._pool_lock:
+            if self._pool is not None:
+                self._pool.closeall()
+                self._pool = None
+
     @contextmanager
     def _get_conn(self):
-        conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode="require")
+        pool = None if self._connection_factory else self._connection_pool()
+        conn = self._connection_factory() if self._connection_factory else pool.getconn()
         try:
             yield conn
             conn.commit()
@@ -20,7 +42,34 @@ class DatabaseService:
             conn.rollback()
             raise
         finally:
-            conn.close()
+            if pool is None:
+                conn.close()
+            else:
+                pool.putconn(conn, close=bool(conn.closed))
+
+    def acquire_processing_lock(self, image_id):
+        """Transaction advisory lock serializes one image across backend workers."""
+        pool = self._connection_pool()
+        conn = pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute('SELECT pg_try_advisory_xact_lock(hashtextextended(%s, 0))', (image_id,))
+                acquired = cur.fetchone()[0]
+            if not acquired:
+                conn.rollback()
+                pool.putconn(conn)
+                return None
+            return conn
+        except Exception:
+            conn.rollback()
+            pool.putconn(conn, close=bool(conn.closed))
+            raise
+
+    def release_processing_lock(self, conn, image_id):
+        try:
+            conn.rollback()  # Releases transaction lock, including on failure.
+        finally:
+            self._connection_pool().putconn(conn, close=bool(conn.closed))
 
     def check_connection(self) -> None:
         with self._get_conn() as conn:
@@ -42,6 +91,24 @@ class DatabaseService:
                     (str(drug_id), str(name).strip(), str(drug_type or '').strip(), bool(is_discontinued))
                     for drug_id, name, drug_type, is_discontinued in cur.fetchall()
                 ]
+
+    def fetch_product_catalog(self):
+        from psycopg2.extras import RealDictCursor
+        requested = os.getenv('DRUG_CATALOG_IMPORT_ID')
+        with self._get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                if requested:
+                    cur.execute('SELECT import_id FROM public.drug_catalog_imports WHERE import_id = %s', (requested,))
+                else:
+                    cur.execute('SELECT import_id FROM public.drug_catalog_imports ORDER BY imported_at DESC, import_id LIMIT 1')
+                selected = cur.fetchone()
+                if not selected:
+                    raise ValueError('No matching drug catalog import exists')
+                import_id = selected['import_id']
+                cur.execute('''SELECT product_id, brand_name, generic_name, dosage_strength,
+                    dosage_form, routes, is_veterinary FROM public.drug_products
+                    WHERE import_id = %s AND NOT is_veterinary''', (import_id,))
+                return str(import_id), [dict(row) for row in cur.fetchall()]
 
     def create_capture_session(
         self,
@@ -76,6 +143,7 @@ class DatabaseService:
         image_bytes: bytes,
         width: int,
         height: int,
+        file_path: str | None = None,
         exposure_time: float | None = None,
         iso_sensitivity: int | None = None,
         focal_length: float | None = None,
@@ -115,7 +183,7 @@ class DatabaseService:
                     RETURNING image_id
                     """,
                     (
-                        session_id, None, checksum, width, height,
+                        session_id, file_path, checksum, width, height,
                         exposure_time, iso_sensitivity, focal_length,
                         "captured", attempt_number,
                     ),
@@ -134,6 +202,20 @@ class DatabaseService:
                         f"capture session {session_id} update affected {cur.rowcount} rows"
                     )
                 return image_id, attempt_number
+
+    def get_prescription_image_path(self, *, image_id: str) -> str | None:
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT file_path
+                    FROM "PRESCRIPTION_IMAGE"
+                    WHERE image_id = %s
+                    """,
+                    (image_id,),
+                )
+                row = cur.fetchone()
+                return str(row[0]) if row and row[0] else None
 
     def update_prescription_image_status(self, *, image_id: str, status: str) -> None:
         with self._get_conn() as conn:
@@ -160,6 +242,13 @@ class DatabaseService:
                 )
                 return cur.fetchone() is not None
 
+    def prescription_image_matches(self, *, image_id: str, image_bytes: bytes) -> bool:
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute('SELECT checksum FROM "PRESCRIPTION_IMAGE" WHERE image_id = %s', (image_id,))
+                row = cur.fetchone()
+                return bool(row and row[0] == hashlib.sha256(image_bytes).hexdigest())
+
     def has_completed_transcription_result(self, *, image_id: str) -> bool:
         with self._get_conn() as conn:
             with conn.cursor() as cur:
@@ -171,8 +260,11 @@ class DatabaseService:
                       ON j.preprocessing_id = p.preprocessing_id
                     JOIN "TRANSCRIPTION_OUTPUTS" o
                       ON o.job_id = j.job_id
+                    JOIN structured_prescription s ON s.output_id = o.output_id
                     WHERE p.image_id = %s
-                      AND j.job_status = 'completed'
+                      AND j.job_status = 'completed' AND o.output_status = 'completed'
+                      AND EXISTS (SELECT 1 FROM "PRESCRIPTION_IMAGE" i
+                                  WHERE i.image_id = p.image_id AND i.capture_status = 'processed')
                     LIMIT 1
                     """,
                     (image_id,),
@@ -477,7 +569,7 @@ class DatabaseService:
                     """
                     INSERT INTO drug_match_results
                         (raw_input, matched_name, match_score, field_id, lexicon_id,
-                         match_type, is_flagged, flag_reason)
+                         match_type, is_flagged, flag_reason, product_id)
                     VALUES %s
                     RETURNING match_id, field_id
                     """,
@@ -486,7 +578,7 @@ class DatabaseService:
                             item["raw_input"], item.get("matched_name"),
                             item.get("raw_score"), item["field_id"],
                             item.get("lexicon_id"), item.get("match_type"),
-                            item["is_flagged"], item.get("flag_reason"),
+                            item["is_flagged"], item.get("flag_reason"), item.get("product_id"),
                         )
                         for item in matches
                     ],
@@ -548,7 +640,7 @@ class DatabaseService:
                          lexicon_id, dosage, frequency, route, duration, quantity,
                          line_item_status, brand_name, strength, dosage_form,
                          dose_amount, timing, meal_relation,
-                         administration_instructions, duration_source)
+                         administration_instructions, duration_source, product_id)
                     VALUES %s
                     RETURNING line_item_id, item_order
                     """,
@@ -563,7 +655,7 @@ class DatabaseService:
                             item.get("dose_amount"), item.get("timing"),
                             item.get("meal_relation"),
                             item.get("administration_instructions"),
-                            item.get("duration_source"),
+                            item.get("duration_source"), item.get("product_id"),
                         )
                         for item in line_items
                     ],
@@ -711,6 +803,7 @@ fetch_drug_catalog = _db_service.fetch_drug_catalog
 log_validate_capture = _db_service.log_validate_capture
 create_capture_session = _db_service.create_capture_session
 create_prescription_image = _db_service.create_prescription_image
+get_prescription_image_path = _db_service.get_prescription_image_path
 update_prescription_image_status = _db_service.update_prescription_image_status
 prescription_image_exists = _db_service.prescription_image_exists
 has_completed_transcription_result = _db_service.has_completed_transcription_result

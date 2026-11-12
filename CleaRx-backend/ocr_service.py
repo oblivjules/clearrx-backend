@@ -43,11 +43,10 @@ class OCRService:
     )
 
     def __init__(self) -> None:
-        # Locate fine-tuned model checkpoint
-        _runs_dir = Path(__file__).resolve().parent / "runs" / "trocr-rx"
-        _best = _runs_dir / "best"
-        _ep20 = _runs_dir / "checkpoint-epoch-20"
-        self._ft_path = _best if _best.exists() else (_ep20 if _ep20.exists() else None)
+        from recognition_config import local_model_configuration
+        config = local_model_configuration()
+        self._BASE_MODEL_ID = config["base_model"]
+        self._ft_path = Path(config["weights_path"]) if config["weights_path"] != "n/a" else None
 
         # Model instances — fine-tuned is eager, base model is lazy
         self._ft_processor: TrOCRProcessor | None = None
@@ -382,7 +381,8 @@ class OCRService:
         """
         Accept a BGR (preferred) or grayscale ndarray and return (text, confidence).
 
-        Uses the local fine-tuned checkpoint with a base TrOCR fallback.
+        Runs genuine local TrOCR as the primary engine or external-service fallback.
+        Uses the explicitly configured checkpoint or base TrOCR model.
         """
         if self._ft_path is not None:
             self._load_ft_model()
@@ -455,7 +455,7 @@ class OCRService:
                 conf = self._pharma_confidence_boost(text, conf)
 
             kept = text and conf >= self._MIN_LINE_CONF and not self._is_noise_line(text)
-            print(f"[DEBUG] Line text: {text!r}  conf={conf:.3f}  kept={kept}")
+            print(f"[DEBUG] Line conf={conf:.3f} kept={bool(kept)}")
             if kept:
                 texts.append(text)
                 confidences.append(conf)

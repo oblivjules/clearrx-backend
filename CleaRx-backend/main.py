@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, APIRouter, Request
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
@@ -23,9 +24,11 @@ logger = logging.getLogger(__name__)
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
 from image_processor import ImageProcessor
-from trocr_service import run_trocr_ocr
+from trocr_service import run_trocr_ocr, resolve_model, PRIMARY_OPTION, LOCAL_MODEL
 from drug_validator import validate_drug_name, DrugValidator
 from parser import parse_prescription, refresh_drug_catalog, _drug_name_passes_sanity
+from result_policy import extracted_fields, apply_match_review, public_medicine
+from runtime_policy import validate_runtime
 
 try:
     from db import check_database_connection as _check_database_connection
@@ -33,6 +36,7 @@ try:
     from db import log_validate_capture as _db_log_validate_capture
     from db import create_capture_session as _db_create_capture_session
     from db import create_prescription_image as _db_create_prescription_image
+    from db import get_prescription_image_path as _db_get_prescription_image_path
     from db import update_prescription_image_status as _db_update_image_status
     from db import prescription_image_exists as _db_prescription_image_exists
     from db import has_completed_transcription_result as _db_has_completed_transcription_result
@@ -282,6 +286,7 @@ def _persist_module_2(
     image_id: str | None,
     preprocessing_id: str | None,
     provider: str,
+    model: str | None = None,
     raw_text: str,
     confidence: float,
     image_shape: tuple[int, ...],
@@ -298,27 +303,20 @@ def _persist_module_2(
         image_id, request_id,
     )
 
-    model_name = provider
-    prefix = "TROCR"
+    model_name = model or provider
     model_id = None
     job_id = None
     try:
+        if provider == "claude-vision":
+            metadata = dict(base_model="n/a", fine_tuned_on="n/a", weights_path="n/a")
+            version = os.getenv("CLAUDE_MODEL_VERSION", "1")
+        else:
+            from recognition_config import local_model_configuration
+            metadata = local_model_configuration()
+            version = os.getenv("TROCR_MODEL_VERSION", "1")
         model_id = _db_get_or_create_trocr_model(
-            model_name=model_name,
-            model_version=os.getenv(f"{prefix}_MODEL_VERSION", "1"),
-            base_model=os.getenv(
-                f"{prefix}_BASE_MODEL",
-                "microsoft/trocr-base-handwritten",
-            ),
-            fine_tuned_on=os.getenv(
-                f"{prefix}_FINE_TUNED_ON",
-                "CleaRx prescription dataset",
-            ),
-            weights_path=os.getenv(
-                f"{prefix}_WEIGHTS_PATH",
-                "runs/trocr-rx/best",
-            ),
-            status=os.getenv(f"{prefix}_MODEL_STATUS", "active"),
+            model_name=model_name, model_version=version,
+            **metadata, status="active",
         )
     except Exception as exc:
         logger.error("trocr_model_registry failed (image_id=%s, step=model): %s", image_id, exc)
@@ -351,11 +349,7 @@ def _persist_module_2(
         cursor = 0
         field_sequence = 0
         for medicine in raw_medicines or medicines:
-            for field_name, value in medicine.items():
-                if field_name.startswith("_"):
-                    continue
-                if value is None:
-                    continue
+            for field_name, value in extracted_fields(medicine):
                 field_value = str(value)
                 start = raw_text.find(field_value, cursor)
                 if start < 0:
@@ -388,13 +382,14 @@ def _persist_modules_3_4(
     raw_medicines: list[dict],
     ocr_confidence: float,
     request_id: str | None = None,
-) -> None:
+) -> bool:
     if not _DB_AVAILABLE or not output_id:
-        return
+        return False
     logger.info(
         "persistence entry module=drug_matches_structured image_id=%s request_id=%s",
         image_id, request_id,
     )
+    matches_saved = False
     try:
         match_rows = []
         raw_by_index = {
@@ -404,15 +399,12 @@ def _persist_modules_3_4(
         for index, medicine in enumerate(raw_medicines):
             raw_drug = medicine.get("_drug_name_raw") or medicine.get("drug_name")
             if not raw_drug:
-                field_sequence += sum(
-                    value is not None and not name.startswith("_")
-                    for name, value in medicine.items()
-                )
+                field_sequence += len(extracted_fields(medicine))
                 continue
             result = (
                 {}
                 if medicine.get("_drug_name_is_class")
-                else validate_drug_name(str(raw_drug))
+                else medicine.get("_drug_validation") or validate_drug_name(str(raw_drug))
             )
             _persist_drug_validation(
                 image_id=image_id,
@@ -426,14 +418,17 @@ def _persist_modules_3_4(
                 or not result.get("matched")
                 or float(fuzzy_score or 0.0) < LOW_MATCH_CONFIDENCE
             )
-            reasons = []
+            flagged = flagged or bool(result.get("review_reasons"))
+            reasons = list(result.get("review_reasons") or [])
             if not result.get("matched"):
                 reasons.append("no_lexicon_match")
             if result.get("matched") and float(fuzzy_score or 0.0) < LOW_MATCH_CONFIDENCE:
                 reasons.append("low_match_score")
             if ocr_confidence < LOW_OCR_CONFIDENCE:
                 reasons.append("low_ocr_confidence")
-            field_id = field_ids.get(field_sequence)
+            field_order = [name for name, _ in extracted_fields(medicine)]
+            drug_offset = field_order.index("drug_name") if "drug_name" in field_order else None
+            field_id = field_ids.get(field_sequence + drug_offset) if drug_offset is not None else None
             if field_id:
                 match_rows.append({
                     "raw_input": str(raw_drug),
@@ -441,6 +436,7 @@ def _persist_modules_3_4(
                     "raw_score": result.get("raw_score"),
                     "field_id": field_id,
                     "lexicon_id": _LEXICON_ID_BY_NAME.get(str(matched_name or "").lower(), (None, False))[0],
+                    "product_id": medicine.get("_product_id"),
                     "match_type": result.get("match_type"),
                     "is_flagged": flagged,
                     "flag_reason": ",".join(reasons) or None,
@@ -452,11 +448,9 @@ def _persist_modules_3_4(
                     "score_cutoff_used": result.get("score_cutoff_used"),
                     "correction_applied": bool(matched_name and matched_name != raw_drug),
                 })
-            field_sequence += sum(
-                value is not None and not name.startswith("_")
-                for name, value in raw_by_index[index].items()
-            )
+            field_sequence += len(extracted_fields(raw_by_index[index]))
         _db_persist_drug_matches(matches=match_rows)
+        matches_saved = True
     except Exception as exc:
         logger.error("drug matching persistence failed (image_id=%s, output_id=%s, step=matches): %s", image_id, output_id, exc)
 
@@ -469,7 +463,7 @@ def _persist_modules_3_4(
             result = (
                 {}
                 if raw.get("_drug_name_is_class")
-                else validate_drug_name(str(raw_drug or "")) if raw_drug else {}
+                else medicine.get("_drug_validation") or (validate_drug_name(str(raw_drug or "")) if raw_drug else {})
             )
             matched = bool(result.get("matched"))
             fuzzy = float(result.get("confidence") or 0.0) if matched else None
@@ -481,7 +475,7 @@ def _persist_modules_3_4(
             }
             marker_fields = set(medicine.get("_marker_fields") or [])
             fields = []
-            for name, value in medicine.items():
+            for name, value in extracted_fields(medicine):
                 if (
                     name.startswith("_")
                     or name in {
@@ -496,7 +490,7 @@ def _persist_modules_3_4(
                     0.5 * ocr_confidence + 0.5 * (fuzzy_value or 0.0)
                     if name in {"drug_name", "brand_name"} else ocr_confidence
                 )
-                if name in marker_fields:
+                if name in marker_fields or result.get("field_validation", {}).get(name) == "conflict":
                     composite = min(composite, UNCERTAIN_FIELD_SCORE_CAP)
                 fields.append({
                     "field_name": name,
@@ -508,6 +502,7 @@ def _persist_modules_3_4(
                 })
             line_items.append({
                 "item_order": index + 1,
+                "product_id": medicine.get("_product_id"),
                 "drug_name_raw": raw_drug,
                 "drug_name_matched": medicine.get("drug_name") if matched else None,
                 "lexicon_id": _LEXICON_ID_BY_NAME.get(str(medicine.get("drug_name") or "").lower(), (None, False))[0],
@@ -540,8 +535,10 @@ def _persist_modules_3_4(
                 "(image_id=%s, output_id=%s, step=structured)",
                 image_id, output_id,
             )
+        return bool(prescription_id) and matches_saved
     except Exception as exc:
         logger.error("structured prescription persistence failed (image_id=%s, output_id=%s, step=structured): %s", image_id, output_id, exc)
+    return False
 
 
 def _persist_drug_validation(
@@ -577,18 +574,23 @@ def _persist_drug_validation(
 # ── Service singletons ─────────────────────────────────────────────────────────
 _img_proc = ImageProcessor()
 _LEXICON_ID_BY_NAME: dict[str, tuple[str, bool]] = {}
+_STORAGE_ROOT = Path(
+    os.getenv("FILE_STORAGE_DIR", str(Path(__file__).resolve().parent / "storage"))
+).resolve()
 
 
 # ── Lifespan ───────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    environment = validate_runtime()
+    logger.info("Runtime mode=%s; local/test deployment only", environment)
     print("[startup] CleaRx Backend v12.0.0")
     print(f"[startup] ImageProcessor   : ready")
     print("[startup] OCRService       : (trocr_service)")
     if _DB_AVAILABLE:
         try:
-            _check_database_connection()
-            drug_catalog = _fetch_drug_catalog()
+            await asyncio.to_thread(_check_database_connection)
+            drug_catalog = await asyncio.to_thread(_fetch_drug_catalog)
             global _LEXICON_ID_BY_NAME
             _LEXICON_ID_BY_NAME = {}
             duplicate_names: set[str] = set()
@@ -612,13 +614,33 @@ async def lifespan(app: FastAPI):
                 print(f"[startup] Drug catalog: {catalog_size} names loaded from Supabase")
             else:
                 print("[startup] Drug catalog: empty; using legacy local lexicon")
+            try:
+                from db import _db_service
+                from product_catalog import ProductCatalog
+                import_id, products = await asyncio.to_thread(_db_service.fetch_product_catalog)
+                catalog = ProductCatalog(products, import_id)
+                if not catalog.products or not catalog.name_products:
+                    raise ValueError("Selected product catalog has no usable human products")
+                DrugValidator.use_product_catalog(catalog)
+                refresh_drug_catalog()
+                print(
+                    f"[startup] Product catalog: {len(catalog.products)} human records, "
+                    f"{len(catalog.name_products)} brand/generic names (import {import_id})"
+                )
+            except Exception:
+                logger.exception("Product catalog unavailable; retaining legacy name matching")
             print("[startup] Supabase database: connected")
         except Exception as exc:
             print(f"[startup] Supabase database: connection/catalog failed ({exc})")
     else:
         print("[startup] Supabase database: disabled (database module unavailable)")
-    yield
-    print("[shutdown] CleaRx Backend stopping")
+    try:
+        yield
+    finally:
+        if _DB_AVAILABLE:
+            from db import _db_service
+            await asyncio.to_thread(_db_service.close)
+        print("[shutdown] CleaRx Backend stopping")
 
 
 # ── FastAPI app ────────────────────────────────────────────────────────────────
@@ -626,7 +648,7 @@ app = FastAPI(title="CleaRx Backend", version="12.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[origin.strip() for origin in os.getenv("CORS_ORIGINS", "http://localhost:8000").split(",") if origin.strip()],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -636,16 +658,240 @@ router = APIRouter()
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
+async def _read_validated_image(file: UploadFile) -> tuple[bytes, np.ndarray, str]:
+    from image_upload import MAX_BYTES, decode_image
+    raw = await file.read(MAX_BYTES + 1)
+    try:
+        image, suffix = await asyncio.to_thread(decode_image, raw, file.content_type)
+    except HTTPException as exc:
+        logger.warning("Image upload rejected: HTTP %s, %s", exc.status_code, exc.detail)
+        raise
+    return raw, image, suffix
+
+
+@router.post("/upload-file")
+async def upload_file(
+    file: UploadFile = File(...),
+    session_id: str = Form(...),
+):
+    if not _DB_AVAILABLE:
+        raise HTTPException(status_code=503, detail="database unavailable")
+
+    raw, image, suffix = await _read_validated_image(file)
+    image_id: str | None = None
+    stored_path: Path | None = None
+    try:
+        _STORAGE_ROOT.mkdir(parents=True, exist_ok=True)
+        stored_path = _STORAGE_ROOT / f"{uuid.uuid4()}{suffix}"
+        stored_path.write_bytes(raw)
+        image_id, attempt_number = await asyncio.to_thread(_db_create_prescription_image,
+            session_id=session_id,
+            image_bytes=raw,
+            width=int(image.shape[1]),
+            height=int(image.shape[0]),
+            file_path=str(stored_path),
+        )
+    except ValueError as exc:
+        if stored_path:
+            stored_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        if stored_path:
+            stored_path.unlink(missing_ok=True)
+        logger.error("file upload failed (session_id=%s): %s", session_id, exc)
+        raise HTTPException(status_code=503, detail="file upload failed") from exc
+
+    validation = await _validate_image_quality(image, image_id=image_id)
+    if not validation["is_usable"]:
+        raise HTTPException(status_code=422, detail={
+            "status": "rejected",
+            "image_id": image_id,
+            "attempt_number": attempt_number,
+            **validation,
+        })
+    return {
+        "status": "created",
+        "image_id": image_id,
+        "attempt_number": attempt_number,
+        "content_type": file.content_type,
+        "size_bytes": len(raw),
+    }
+
+
+@router.get("/files/{image_id}")
+def retrieve_file(image_id: str):
+    if not _DB_AVAILABLE:
+        raise HTTPException(status_code=503, detail="database unavailable")
+    try:
+        uuid.UUID(image_id)
+        stored_path = _db_get_prescription_image_path(image_id=image_id)
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(status_code=400, detail="image_id must be a valid UUID")
+    except Exception as exc:
+        logger.error("file lookup failed (image_id=%s): %s", image_id, exc)
+        raise HTTPException(status_code=503, detail="database lookup failed") from exc
+    if not stored_path:
+        raise HTTPException(status_code=404, detail="file is not available")
+    path = Path(stored_path).resolve()
+    try:
+        path.relative_to(_STORAGE_ROOT)
+    except ValueError:
+        logger.error("refusing file path outside storage root (image_id=%s)", image_id)
+        raise HTTPException(status_code=500, detail="stored file path is invalid")
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="file is not available")
+    return FileResponse(path)
+
+
+@router.post("/validate-upload")
+async def validate_upload(file: UploadFile = File(...)):
+    """Check a crop without storing an image or counting a capture attempt."""
+    _, image, _ = await _read_validated_image(file)
+    return await _validate_image_quality(image)
+
+
+async def _validate_image_quality(
+    img: np.ndarray, *, image_id: str | None = None,
+    t_start: float | None = None,
+):
+    if t_start is None:
+        t_start = time.perf_counter()
+    lighting = await asyncio.to_thread(_img_proc.check_lighting, img)
+    if lighting == "good":
+        lighting = await asyncio.to_thread(_img_proc.check_lighting_cnr, img)
+
+    blur     = await asyncio.to_thread(_img_proc.check_blur, img)
+    quad     = await asyncio.to_thread(_img_proc.find_paper_quad, img, min_coverage=0.06)
+    img_area = img.shape[0] * img.shape[1]
+
+    framing           = "not_found"
+    doc_quad_response = None
+    if quad is not None:
+        coverage = await asyncio.to_thread(cv2.contourArea, quad) / img_area
+        framing  = "aligned" if coverage >= 0.10 else "too_small"
+        if framing == "aligned":
+            h_img, w_img = img.shape[:2]
+            ordered      = await asyncio.to_thread(_img_proc._order_points, quad)
+            doc_quad_response = {
+                "top_left":     {"x": float(ordered[0][0] / w_img), "y": float(ordered[0][1] / h_img)},
+                "top_right":    {"x": float(ordered[1][0] / w_img), "y": float(ordered[1][1] / h_img)},
+                "bottom_right": {"x": float(ordered[2][0] / w_img), "y": float(ordered[2][1] / h_img)},
+                "bottom_left":  {"x": float(ordered[3][0] / w_img), "y": float(ordered[3][1] / h_img)},
+            }
+
+    quality_score = await asyncio.to_thread(_img_proc._fast_readability_score, img)
+    hw = await asyncio.to_thread(_img_proc.detect_handwriting, img)
+    text_type = "handwritten" if hw["is_handwritten"] else "printed"
+
+    effective_threshold = 55
+    if hw["is_handwritten"] and hw["confidence"] >= 0.7:
+        quality_score = min(quality_score + 8, 100)
+        effective_threshold = 50
+    elif text_type == "printed":
+        effective_threshold = 65
+
+    quality_ok = quality_score >= effective_threshold
+
+    if lighting == "too_dark":
+        msg = "Too dark — move to a brighter spot."
+    elif lighting == "too_bright":
+        msg = "Too bright — tilt slightly to reduce glare."
+    elif blur == "blurry":
+        msg = "Hold still a moment…"
+    elif not quality_ok:
+        msg = "Text not clear enough — adjust framing and hold still."
+    elif framing == "too_small":
+        msg = "Move a little closer to keep the prescription in frame."
+    else:
+        msg = "Looks good — tap capture!"
+
+    is_usable = (lighting == "good" and blur == "sharp" and quality_ok)
+    rejection_reason = (
+        None if is_usable
+        else "lighting" if lighting != "good"
+        else "blur" if blur != "sharp"
+        else "readability"
+    )
+
+    # ── Compute metrics for DB ─────────────────────────────────────────────────
+    _gray_m    = await asyncio.to_thread(cv2.cvtColor, img, cv2.COLOR_BGR2GRAY)
+    _cy, _cx   = _gray_m.shape[0] // 2, _gray_m.shape[1] // 2
+    _roi_m     = _gray_m[int(_cy * 0.3): int(_cy * 1.7), int(_cx * 0.3): int(_cx * 1.7)]
+    _mean_v    = float(np.mean(_roi_m))
+    _std_v     = float(np.std(_roi_m))
+    _blown_pct = float(np.sum(_roi_m > 248)) / _roi_m.size * 100.0
+    _dark_pct  = float(np.sum(_roi_m < 30))  / _roi_m.size * 100.0
+    _cnr       = _mean_v / _std_v if _std_v > 0.5 else 0.0
+    _laplacian = await asyncio.to_thread(cv2.Laplacian, _gray_m, cv2.CV_64F)
+    _lap_var   = float(_laplacian.var())
+
+    if quad is not None:
+        _h_img, _w_img = img.shape[:2]
+        _ord         = await asyncio.to_thread(_img_proc._order_points, quad)
+        _db_area_pct = await asyncio.to_thread(cv2.contourArea, quad) / img_area * 100.0
+        _db_detected = True
+        _db_tl_x, _db_tl_y = float(_ord[0][0] / _w_img), float(_ord[0][1] / _h_img)
+        _db_tr_x, _db_tr_y = float(_ord[1][0] / _w_img), float(_ord[1][1] / _h_img)
+        _db_br_x, _db_br_y = float(_ord[2][0] / _w_img), float(_ord[2][1] / _h_img)
+        _db_bl_x, _db_bl_y = float(_ord[3][0] / _w_img), float(_ord[3][1] / _h_img)
+    else:
+        _db_area_pct = 0.0
+        _db_detected = False
+        _db_tl_x = _db_tl_y = _db_tr_x = _db_tr_y = 0.0
+        _db_br_x = _db_br_y = _db_bl_x = _db_bl_y = 0.0
+
+    _elapsed_ms = round((time.perf_counter() - t_start) * 1000, 1)
+
+    if _DB_AVAILABLE and image_id:
+        try:
+            await asyncio.to_thread(_db_log_validate_capture,
+                image_id=image_id,
+                quality_score=quality_score,
+                blur_score=_lap_var,
+                is_usable=is_usable,
+                processing_time_ms=_elapsed_ms,
+                detection_mode=framing,
+                lighting_condition=lighting,
+                mean_brightness=_mean_v,
+                contrast_ratio=_cnr,
+                blown_pixels_percent=_blown_pct,
+                dark_pixels_percent=_dark_pct,
+                lighting_feedback=msg,
+                document_detected=_db_detected,
+                top_left_x=_db_tl_x,
+                top_left_y=_db_tl_y,
+                top_right_x=_db_tr_x,
+                top_right_y=_db_tr_y,
+                bottom_right_x=_db_br_x,
+                bottom_right_y=_db_br_y,
+                bottom_left_x=_db_bl_x,
+                bottom_left_y=_db_bl_y,
+                document_area_percent=_db_area_pct,
+                framing_status=framing,
+            )
+        except Exception as _e:
+            print(f"[db] validate-capture log failed: {_e}")
+
+    return {
+        "is_usable": is_usable,
+        "rejection_reason": rejection_reason,
+        "feedback":  {"lighting": lighting, "blur": blur, "framing": framing},
+        "instruction": msg,
+        "quality_score": quality_score,
+        "document_quad": doc_quad_response,
+    }
+
+
+
 @router.post("/preview-check")
 async def preview_check(file: UploadFile = File(...)):
-    raw = await file.read()
-    img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
+    raw, img, suffix = await _read_validated_image(file)
     if img is None:
         return {"readable": False, "score": 0, "instruction": "Camera error — please retry."}
 
-    lighting = _img_proc.check_lighting(img)
+    lighting = await asyncio.to_thread(_img_proc.check_lighting, img)
     if lighting == "good":
-        lighting = _img_proc.check_lighting_cnr(img)
+        lighting = await asyncio.to_thread(_img_proc.check_lighting_cnr, img)
 
     if lighting == "too_dark":
         return {"readable": False, "score": 0,
@@ -654,13 +900,13 @@ async def preview_check(file: UploadFile = File(...)):
         return {"readable": False, "score": 0,
                 "instruction": "Too bright — tilt slightly to reduce glare."}
 
-    blur = _img_proc.check_blur(img)
+    blur = await asyncio.to_thread(_img_proc.check_blur, img)
     if blur == "blurry":
         return {"readable": False, "score": 0,
                 "instruction": "Hold still — text is blurry."}
 
-    score     = _img_proc._fast_readability_score(img)
-    hw        = _img_proc.detect_handwriting(img)
+    score     = await asyncio.to_thread(_img_proc._fast_readability_score, img)
+    hw        = await asyncio.to_thread(_img_proc.detect_handwriting, img)
     text_type = "handwritten" if hw["is_handwritten"] else "printed"
 
     effective_threshold = 55
@@ -726,16 +972,20 @@ async def create_capture_image(
     if not _DB_AVAILABLE:
         raise HTTPException(status_code=503, detail="database unavailable")
 
-    raw = await file.read()
-    img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
+    raw, img, suffix = await _read_validated_image(file)
     if img is None:
         return {"status": "error", "reason": "invalid_image"}
 
     height, width = img.shape[:2]
+    stored_path = None
     try:
-        image_id, attempt_number = _db_create_prescription_image(
+        _STORAGE_ROOT.mkdir(parents=True, exist_ok=True)
+        stored_path = _STORAGE_ROOT / f"{uuid.uuid4()}{suffix}"
+        stored_path.write_bytes(raw)
+        image_id, attempt_number = await asyncio.to_thread(_db_create_prescription_image,
             session_id=session_id,
             image_bytes=raw,
+            file_path=str(stored_path),
             width=width,
             height=height,
             exposure_time=exposure_time,
@@ -744,6 +994,8 @@ async def create_capture_image(
         )
         return {"status": "created", "image_id": image_id, "attempt_number": attempt_number}
     except Exception as exc:
+        if stored_path:
+            stored_path.unlink(missing_ok=True)
         logger.error("capture-image creation failed (session_id=%s): %s", session_id, exc)
         raise HTTPException(status_code=503, detail="capture image creation failed")
 
@@ -780,7 +1032,7 @@ async def validate_capture(
         except (ValueError, TypeError, AttributeError):
             raise HTTPException(status_code=400, detail="image_id must be a valid UUID")
         try:
-            if not _db_prescription_image_exists(image_id=image_id):
+            if not await asyncio.to_thread(_db_prescription_image_exists, image_id=image_id):
                 raise HTTPException(status_code=404, detail="image_id was not found")
         except HTTPException:
             raise
@@ -789,7 +1041,7 @@ async def validate_capture(
             raise HTTPException(status_code=503, detail="database lookup failed")
 
     t_start = time.perf_counter()
-    img = cv2.imdecode(np.frombuffer(await file.read(), np.uint8), cv2.IMREAD_COLOR)
+    raw, img, suffix = await _read_validated_image(file)
     if img is None:
         return {
             "is_usable": False,
@@ -799,138 +1051,20 @@ async def validate_capture(
             "feedback": {"lighting": "unknown", "blur": "unknown", "framing": "unknown"},
         }
 
-    lighting = _img_proc.check_lighting(img)
-    if lighting == "good":
-        lighting = _img_proc.check_lighting_cnr(img)
-
-    blur     = _img_proc.check_blur(img)
-    quad     = _img_proc.find_paper_quad(img, min_coverage=0.06)
-    img_area = img.shape[0] * img.shape[1]
-
-    framing           = "not_found"
-    doc_quad_response = None
-    if quad is not None:
-        coverage = cv2.contourArea(quad) / img_area
-        framing  = "aligned" if coverage >= 0.10 else "too_small"
-        if framing == "aligned":
-            h_img, w_img = img.shape[:2]
-            ordered      = _img_proc._order_points(quad)
-            doc_quad_response = {
-                "top_left":     {"x": float(ordered[0][0] / w_img), "y": float(ordered[0][1] / h_img)},
-                "top_right":    {"x": float(ordered[1][0] / w_img), "y": float(ordered[1][1] / h_img)},
-                "bottom_right": {"x": float(ordered[2][0] / w_img), "y": float(ordered[2][1] / h_img)},
-                "bottom_left":  {"x": float(ordered[3][0] / w_img), "y": float(ordered[3][1] / h_img)},
-            }
-
-    quality_score = _img_proc._fast_readability_score(img)
-    hw = _img_proc.detect_handwriting(img)
-    text_type = "handwritten" if hw["is_handwritten"] else "printed"
-
-    effective_threshold = 55
-    if hw["is_handwritten"] and hw["confidence"] >= 0.7:
-        quality_score = min(quality_score + 8, 100)
-        effective_threshold = 50
-    elif text_type == "printed":
-        effective_threshold = 65
-
-    quality_ok = quality_score >= effective_threshold
-
-    if lighting == "too_dark":
-        msg = "Too dark — move to a brighter spot."
-    elif lighting == "too_bright":
-        msg = "Too bright — tilt slightly to reduce glare."
-    elif blur == "blurry":
-        msg = "Hold still a moment…"
-    elif not quality_ok:
-        msg = "Text not clear enough — adjust framing and hold still."
-    elif framing == "too_small":
-        msg = "Move a little closer to keep the prescription in frame."
-    else:
-        msg = "Looks good — tap capture!"
-
-    is_usable = (lighting == "good" and blur == "sharp" and quality_ok)
-    rejection_reason = (
-        None if is_usable
-        else "lighting" if lighting != "good"
-        else "blur" if blur != "sharp"
-        else "readability"
-    )
-
-    # ── Compute metrics for DB ─────────────────────────────────────────────────
-    _gray_m    = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    _cy, _cx   = _gray_m.shape[0] // 2, _gray_m.shape[1] // 2
-    _roi_m     = _gray_m[int(_cy * 0.3): int(_cy * 1.7), int(_cx * 0.3): int(_cx * 1.7)]
-    _mean_v    = float(np.mean(_roi_m))
-    _std_v     = float(np.std(_roi_m))
-    _blown_pct = float(np.sum(_roi_m > 248)) / _roi_m.size * 100.0
-    _dark_pct  = float(np.sum(_roi_m < 30))  / _roi_m.size * 100.0
-    _cnr       = _mean_v / _std_v if _std_v > 0.5 else 0.0
-    _lap_var   = float(cv2.Laplacian(_gray_m, cv2.CV_64F).var())
-
-    if quad is not None:
-        _h_img, _w_img = img.shape[:2]
-        _ord         = _img_proc._order_points(quad)
-        _db_area_pct = cv2.contourArea(quad) / img_area * 100.0
-        _db_detected = True
-        _db_tl_x, _db_tl_y = float(_ord[0][0] / _w_img), float(_ord[0][1] / _h_img)
-        _db_tr_x, _db_tr_y = float(_ord[1][0] / _w_img), float(_ord[1][1] / _h_img)
-        _db_br_x, _db_br_y = float(_ord[2][0] / _w_img), float(_ord[2][1] / _h_img)
-        _db_bl_x, _db_bl_y = float(_ord[3][0] / _w_img), float(_ord[3][1] / _h_img)
-    else:
-        _db_area_pct = 0.0
-        _db_detected = False
-        _db_tl_x = _db_tl_y = _db_tr_x = _db_tr_y = 0.0
-        _db_br_x = _db_br_y = _db_bl_x = _db_bl_y = 0.0
-
-    _elapsed_ms = round((time.perf_counter() - t_start) * 1000, 1)
-
-    if _DB_AVAILABLE:
-        try:
-            _db_log_validate_capture(
-                image_id=image_id,
-                quality_score=quality_score,
-                blur_score=_lap_var,
-                is_usable=is_usable,
-                processing_time_ms=_elapsed_ms,
-                detection_mode=framing,
-                lighting_condition=lighting,
-                mean_brightness=_mean_v,
-                contrast_ratio=_cnr,
-                blown_pixels_percent=_blown_pct,
-                dark_pixels_percent=_dark_pct,
-                lighting_feedback=msg,
-                document_detected=_db_detected,
-                top_left_x=_db_tl_x,
-                top_left_y=_db_tl_y,
-                top_right_x=_db_tr_x,
-                top_right_y=_db_tr_y,
-                bottom_right_x=_db_br_x,
-                bottom_right_y=_db_br_y,
-                bottom_left_x=_db_bl_x,
-                bottom_left_y=_db_bl_y,
-                document_area_percent=_db_area_pct,
-                framing_status=framing,
-            )
-        except Exception as _e:
-            print(f"[db] validate-capture log failed: {_e}")
-
-    return {
-        "is_usable": is_usable,
-        "rejection_reason": rejection_reason,
-        "feedback":  {"lighting": lighting, "blur": blur, "framing": framing},
-        "instruction": msg,
-        "quality_score": quality_score,
-        "document_quad": doc_quad_response,
-    }
+    return await _validate_image_quality(img, image_id=image_id, t_start=t_start)
 
 
-@router.post("/process-image")
-async def process_image(
+async def _process_image(
     request: Request,
     file: UploadFile = File(...),
     image_id: str | None = Form(None),
     ground_truth: str | None = Form(None),   # ← QA / CER-only
+    model: str = Form(PRIMARY_OPTION),
 ):
+    try:
+        selected_model, selected_label = resolve_model(model)
+    except ValueError as exc:
+        raise HTTPException(422, "Unsupported recognition option") from exc
     request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
     logger.info(
         "process-image entry image_id=%s request_id=%s",
@@ -947,7 +1081,7 @@ async def process_image(
         except (ValueError, TypeError, AttributeError):
             raise HTTPException(status_code=400, detail="image_id must be a valid UUID")
         try:
-            if not _db_prescription_image_exists(image_id=image_id):
+            if not await asyncio.to_thread(_db_prescription_image_exists, image_id=image_id):
                 raise HTTPException(status_code=404, detail="image_id was not found")
         except HTTPException:
             raise
@@ -958,13 +1092,11 @@ async def process_image(
     skip_persistence = False
     if image_id and _DB_AVAILABLE and not skip_persistence:
         try:
-            skip_persistence = _db_has_completed_transcription_result(image_id=image_id)
+            skip_persistence = await asyncio.to_thread(_db_has_completed_transcription_result, image_id=image_id)
             if skip_persistence:
-                logger.info(
-                    "persistence skipped: completed result already exists "
-                    "(image_id=%s, request_id=%s)",
-                    image_id, request_id,
-                )
+                raise HTTPException(409, "This image already has a saved result; capture or upload a new image to process again")
+        except HTTPException:
+            raise
         except Exception as exc:
             logger.error(
                 "idempotency check failed (image_id=%s, request_id=%s): %s",
@@ -974,50 +1106,60 @@ async def process_image(
 
     t_start = time.perf_counter()
     preprocessing_started_at = datetime.now(timezone.utc)
-    raw     = await file.read()
+    raw, img, suffix = await _read_validated_image(file)
     if image_id and _DB_AVAILABLE and not skip_persistence:
+        from db import _db_service
         try:
-            _db_update_image_status(image_id=image_id, status="processing")
+            matches = await asyncio.to_thread(_db_service.prescription_image_matches,
+                                             image_id=image_id, image_bytes=raw)
+        except Exception as exc:
+            logger.exception("Image checksum lookup failed request_id=%s", request_id)
+            raise HTTPException(503, "Database is unavailable; please retry") from exc
+        if not matches:
+            raise HTTPException(400, "Uploaded image does not match its registered image_id")
+        try:
+            await asyncio.to_thread(_db_update_image_status, image_id=image_id, status="processing")
         except Exception as exc:
             print(f"[db] image processing status update failed: {exc}")
 
-    img     = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
     if img is None:
         if image_id and _DB_AVAILABLE and not skip_persistence:
-            _db_update_image_status(image_id=image_id, status="failed")
+            await asyncio.to_thread(_db_update_image_status, image_id=image_id, status="failed")
         return {"status": "error", "reason": "invalid_image",
                 "message": "Could not decode image."}
 
-    lighting = _img_proc.check_lighting(img)
+    lighting = await asyncio.to_thread(_img_proc.check_lighting, img)
     if lighting == "good":
-        lighting = _img_proc.check_lighting_cnr(img)
+        lighting = await asyncio.to_thread(_img_proc.check_lighting_cnr, img)
     if lighting != "good":
         if image_id and _DB_AVAILABLE and not skip_persistence:
-            _db_update_image_status(image_id=image_id, status="rejected")
+            await asyncio.to_thread(_db_update_image_status, image_id=image_id, status="rejected")
         return {
             "status": "rejected",
             "reason": lighting,
             "message": "Please adjust lighting and retake.",
         }
 
-    if _img_proc.check_blur(img) == "blurry":
+    if await asyncio.to_thread(_img_proc.check_blur, img) == "blurry":
         if image_id and _DB_AVAILABLE:
-            _db_update_image_status(image_id=image_id, status="rejected")
+            await asyncio.to_thread(_db_update_image_status, image_id=image_id, status="rejected")
         return {
             "status": "rejected",
             "reason": "blurry",
             "message": "Image is too blurry. Hold steady and retake.",
         }
 
-    img, was_corrected = _img_proc.perspective_correct(img)
+    img, was_corrected = await asyncio.to_thread(_img_proc.perspective_correct, img)
     detection          = "perspective_corrected" if was_corrected else "frame_region"
 
-    enhanced, readability_confidence, passes_used = _img_proc.enhance_for_handwriting(img)
+    shadow_corrected = await asyncio.to_thread(_img_proc.remove_shadows, img)
+    enhanced, readability_confidence, passes_used = await asyncio.to_thread(
+        _img_proc.enhance_for_handwriting, shadow_corrected)
     preprocessing_id = None
     preprocessing_completed_at = datetime.now(timezone.utc)
     if image_id and _DB_AVAILABLE and not skip_persistence:
         try:
-            preprocessing_id = _db_create_preprocessing_log(
+            preprocessing_id = await asyncio.to_thread(_db_create_preprocessing_log,
                 image_id=image_id,
                 preprocessing_started_at=preprocessing_started_at,
                 preprocessing_completed_at=preprocessing_completed_at,
@@ -1038,25 +1180,55 @@ async def process_image(
             "preprocessing persistence skipped (image_id missing, step=preprocessing)"
         )
 
+    preprocessing_ms = round((time.perf_counter() - t_start) * 1000, 1)
     ocr_started = time.perf_counter()
-    ocr_provider = "trocr-finetuned"
-    try:
-        extracted_text, ocr_confidence = run_trocr_ocr(img)
+    recognized = None
+    if selected_model != LOCAL_MODEL:
+        logger.info("OCR request_id=%s provider=anthropic model=%s", request_id, selected_model)
+        try:
+            recognized = await asyncio.to_thread(run_trocr_ocr, shadow_corrected, model=selected_model)
+        except Exception:
+            logger.exception("Recognition provider failed request_id=%s model=%s", request_id, selected_model)
+    if recognized is not None:
+        extracted_text, provider_confidence = recognized
+        # Legacy NOT NULL storage needs a neutral placeholder, not a probability.
+        ocr_confidence = provider_confidence if provider_confidence is not None else 0.5
+        measured_ocr_confidence = None
+        ocr_provider = "claude-vision"
+        actual_model = selected_model
+        public_source = selected_label
         ocr_error = None
         ocr_failure_reason = None
-    except Exception as exc:
-        extracted_text = ""
-        ocr_confidence = 0.0
-        ocr_error = str(exc)
-        ocr_failure_reason = str(exc)
+    else:
+        try:
+            from ocr_service import run_trocr as run_local_trocr
+            extracted_text, ocr_confidence = await asyncio.to_thread(run_local_trocr, shadow_corrected)
+            measured_ocr_confidence = ocr_confidence
+            ocr_provider = "trocr-local"
+            actual_model = "local-trocr"
+            public_source = selected_label if selected_model == LOCAL_MODEL else "Local TrOCR"
+            ocr_error = None if selected_model == LOCAL_MODEL else "Recognition service unavailable; local TrOCR fallback used"
+            ocr_failure_reason = None
+            logger.info("OCR request_id=%s provider=local model=local-trocr", request_id)
+        except Exception as exc:
+            logger.exception("Local OCR failed request_id=%s", request_id)
+            extracted_text = ""
+            ocr_confidence = 0.0
+            measured_ocr_confidence = None
+            ocr_provider = "trocr-local"
+            actual_model = "local-trocr"
+            public_source = "Unavailable"
+            ocr_error = "Recognition is unavailable; please try again"
+            ocr_failure_reason = type(exc).__name__
 
     ocr_elapsed_ms = round((time.perf_counter() - ocr_started) * 1000, 1)
 
     if not extracted_text or len(extracted_text.strip()) < 4:
         if image_id and _DB_AVAILABLE:
-            _db_update_image_status(image_id=image_id, status="rejected")
-        _, buf_enhanced = cv2.imencode(".png", enhanced, [cv2.IMWRITE_PNG_COMPRESSION, 1])
-        _, buf_original = cv2.imencode(".jpg", img,      [cv2.IMWRITE_JPEG_QUALITY, 80])
+            await asyncio.to_thread(_db_update_image_status, image_id=image_id, status="rejected")
+        display_enhanced = await asyncio.to_thread(_img_proc.create_document_preview, shadow_corrected)
+        _, buf_enhanced = await asyncio.to_thread(cv2.imencode, ".png", display_enhanced, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+        _, buf_original = await asyncio.to_thread(cv2.imencode, ".jpg", img,      [cv2.IMWRITE_JPEG_QUALITY, 80])
 
         # ── CER + persist (no_text path) ───────────────────────────────────
         cer_result = None
@@ -1072,7 +1244,7 @@ async def process_image(
                 f"PASS={cer_result['passes_objective']}"
             )
             if not skip_persistence:
-                _persist_cer(
+                await asyncio.to_thread(_persist_cer,
                     image_id=image_id,
                     ground_truth=ground_truth,
                     hypothesis=extracted_text or "",
@@ -1081,10 +1253,11 @@ async def process_image(
                 )
         if not skip_persistence:
             try:
-                _persist_module_2(
+                await asyncio.to_thread(_persist_module_2,
                     image_id=image_id,
                     preprocessing_id=preprocessing_id,
                     provider=ocr_provider,
+                    model=actual_model,
                     raw_text=extracted_text or "",
                     confidence=ocr_confidence,
                     image_shape=img.shape,
@@ -1106,17 +1279,21 @@ async def process_image(
             "quality_score":      readability_confidence,
             "trocr_confidence":   0,
             "trocr_label":        "No text",
-            "ocr_source":         ocr_provider,
+            "ocr_source":         public_source,
+            "ocr_confidence":     measured_ocr_confidence,
+            "ocr_confidence_basis": "unavailable" if measured_ocr_confidence is None else "uncalibrated_heuristic",
             "passes_used":        passes_used,
             "processing_time_ms": round((time.perf_counter() - t_start) * 1000, 1),
             "cer":                cer_result,
         }
 
+    parsing_started = time.perf_counter()
     # Structure the recognized text using the prescription parser.
     medicines = (
-        parse_prescription(extracted_text, ocr_confidence=ocr_confidence)
+        await asyncio.to_thread(parse_prescription, extracted_text, ocr_confidence=ocr_confidence)
         if extracted_text else []
     )
+    parsing_ms = round((time.perf_counter() - parsing_started) * 1000, 1)
     raw_medicines = [dict(medicine) for medicine in medicines]
     for medicine in medicines:
         for key in (
@@ -1139,21 +1316,33 @@ async def process_image(
             m["drug_name"] = None
             m["uncertain"] = True
 
-    ocr_source = ocr_provider
+    ocr_source = public_source
 
+    matching_started = time.perf_counter()
     drug_validations = []
-    for m in medicines:
-        dn = m.get("drug_name")
+    for medicine_index, m in enumerate(medicines):
+        dn = m.get("drug_name") or m.get("drug_name_raw")
         if dn:
-            dv = validate_drug_name(dn)
+            dv = await asyncio.to_thread(validate_drug_name,
+                raw_medicines[medicine_index].get("_drug_name_raw") or m.get("drug_name_raw") or dn, brand_name=m.get("brand_name"),
+                strength_value=m.get("strength"), dosage_form=m.get("dosage_form"),
+                route_value=m.get("route_of_administration") if m.get("route_source") == "stated" else None)
+            m["_drug_validation"] = dv
+            m["_product_id"] = dv.get("product_id")
+            raw_medicines[medicine_index]["_drug_validation"] = dv
+            raw_medicines[medicine_index]["_product_id"] = dv.get("product_id")
+            m["_catalog_match"] = {k: dv.get(k) for k in (
+                "product_id", "catalog_import_id", "candidates", "field_validation", "review_reasons")}
+            apply_match_review(m, dv)
             drug_validations.append(dv)
             if dv["matched"]:
                 m["drug_name"] = dv["corrected"]
             else:
-                print(f"[main] Discarded unvalidated drug name: {dn!r}")
-                m["drug_name"] = None
+                logger.info("Drug name requires review (request_id=%s)", request_id)
+                m["drug_name"] = dv.get("original") or dn
                 m["uncertain"] = True
 
+    matching_ms = round((time.perf_counter() - matching_started) * 1000, 1)
     first_brand   = medicines[0].get("brand_name") if medicines else None
     first_generic = medicines[0].get("drug_name")  if medicines else None
 
@@ -1162,22 +1351,17 @@ async def process_image(
     else:
         drug_validation = {"original": "", "corrected": "", "confidence": 0.0, "matched": False}
 
-    ocr_conf_pct = round(ocr_confidence * 100)
-    trocr_label  = f"{ocr_conf_pct}%"
+    ocr_conf_pct = round(measured_ocr_confidence * 100) if measured_ocr_confidence is not None else 0
+    trocr_label = "OCR confidence unavailable" if measured_ocr_confidence is None else f"OCR heuristic score: {ocr_conf_pct}%"
 
-    _disp_gray  = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    _disp_clahe = cv2.createCLAHE(clipLimit=1.2, tileGridSize=(8, 8))
-    _disp_img   = _disp_clahe.apply(_disp_gray)
-    _, buf_enhanced = cv2.imencode(".png", _disp_img, [cv2.IMWRITE_PNG_COMPRESSION, 1])
-    _, buf_original = cv2.imencode(".jpg", img,       [cv2.IMWRITE_JPEG_QUALITY, 80])
+    display_enhanced = await asyncio.to_thread(_img_proc.create_document_preview, shadow_corrected)
+    _, buf_enhanced = await asyncio.to_thread(cv2.imencode, ".png", display_enhanced, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+    _, buf_original = await asyncio.to_thread(cv2.imencode, ".jpg", img,       [cv2.IMWRITE_JPEG_QUALITY, 80])
 
     elapsed_ms = round((time.perf_counter() - t_start) * 1000, 1)
 
-    if image_id and _DB_AVAILABLE:
-        try:
-            _db_update_image_status(image_id=image_id, status="processed")
-        except Exception as exc:
-            print(f"[db] image completion status update failed: {exc}")
+    persistence_started = time.perf_counter()
+    persistence_saved = False
 
     try:
         if skip_persistence:
@@ -1186,10 +1370,11 @@ async def process_image(
                 image_id, request_id,
             )
         else:
-            module2_output_id, module2_field_ids = _persist_module_2(
+            module2_output_id, module2_field_ids = await asyncio.to_thread(_persist_module_2,
                 image_id=image_id,
                 preprocessing_id=preprocessing_id,
                 provider=ocr_provider,
+                model=actual_model,
                 raw_text=extracted_text,
                 confidence=ocr_confidence,
                 image_shape=img.shape,
@@ -1199,7 +1384,7 @@ async def process_image(
                 failure_reason=ocr_failure_reason,
                 request_id=request_id,
             )
-            _persist_modules_3_4(
+            persistence_saved = await asyncio.to_thread(_persist_modules_3_4,
                 image_id=image_id,
                 output_id=module2_output_id,
                 field_ids=module2_field_ids,
@@ -1210,6 +1395,13 @@ async def process_image(
             )
     except Exception as exc:
         logger.error("Module 2 persistence failed (image_id=%s, step=success): %s", image_id, exc)
+
+    if image_id and _DB_AVAILABLE:
+        try:
+            await asyncio.to_thread(_db_update_image_status, image_id=image_id, status="processed" if persistence_saved else "save_failed")
+        except Exception:
+            persistence_saved = False
+            logger.exception("Image completion status save failed request_id=%s", request_id)
 
     # ── CER computation + persistence (success path) ──────────────────────────
     cer_result = None
@@ -1231,7 +1423,7 @@ async def process_image(
         if gt_check and not gt_check["matched"]:
             print(f"[CER] ⚠ ground truth drug name unverified: {gt_check['candidate']!r}")
         if not skip_persistence:
-            _persist_cer(
+            await asyncio.to_thread(_persist_cer,
                 image_id=image_id,
                 ground_truth=ground_truth,
                 hypothesis=extracted_text,
@@ -1239,8 +1431,16 @@ async def process_image(
                 request_id=request_id,
             )
 
+    persistence_ms = round((time.perf_counter() - persistence_started) * 1000, 1)
+    elapsed_ms = round((time.perf_counter() - t_start) * 1000, 1)
+    timings = dict(preprocessing_ms=preprocessing_ms, ocr_ms=ocr_elapsed_ms,
+                   parsing_ms=parsing_ms, matching_ms=matching_ms,
+                   persistence_ms=persistence_ms, total_ms=elapsed_ms)
+    logger.info("Processing timings request_id=%s timings=%s", request_id, timings)
     return {
         "status":             "success",
+        "persistence_status": "saved" if persistence_saved else "failed" if _DB_AVAILABLE else "disabled",
+        "stage_timings_ms": timings,
         "detection":          detection,
         "enhanced_image":     base64.b64encode(buf_enhanced).decode(),
         "original_image":     base64.b64encode(buf_original).decode(),
@@ -1255,11 +1455,67 @@ async def process_image(
         "brand_name":         first_brand or drug_validation["original"],
         "drug_confidence":    drug_validation["confidence"],
         "drug_matched":       drug_validation["matched"],
-        "medicines":          medicines,
+        "medicines":          [public_medicine(m) for m in medicines],
+        "name_similarity":    drug_validation.get("raw_score"),
+        "review_required":    any(m.get("review_required") or m.get("uncertain") for m in medicines),
         "ocr_source":         ocr_source,
+        "ocr_confidence":     measured_ocr_confidence,
+        "ocr_confidence_basis": "unavailable" if measured_ocr_confidence is None else "uncalibrated_heuristic",
         "cer":                cer_result,
         **({"ocr_error": ocr_error} if ocr_error else {}),
     }
+
+
+_PROCESSING_LIMIT = asyncio.Semaphore(2)
+
+
+@router.post("/process-image")
+async def process_image(
+    request: Request,
+    file: UploadFile = File(...),
+    image_id: str | None = Form(None),
+    ground_truth: str | None = Form(None),
+    model: str = Form(PRIMARY_OPTION),
+):
+    try:
+        resolve_model(model)
+    except ValueError as exc:
+        raise HTTPException(422, "Unsupported recognition option") from exc
+    async with _PROCESSING_LIMIT:
+        lock_conn = None
+        service = None
+        try:
+            if _DB_AVAILABLE and image_id:
+                try:
+                    uuid.UUID(image_id)
+                except (ValueError, TypeError, AttributeError):
+                    raise HTTPException(400, "image_id must be a valid UUID")
+                from db import _db_service
+                service = _db_service
+                acquisition = asyncio.create_task(asyncio.to_thread(service.acquire_processing_lock, image_id))
+                try:
+                    lock_conn = await asyncio.shield(acquisition)
+                except asyncio.CancelledError:
+                    # Acquire may still be running in a thread. Collect its token
+                    # so finally can release it before propagating cancellation.
+                    lock_conn = await acquisition
+                    raise
+                except Exception as exc:
+                    logger.exception("Unable to acquire image processing lock")
+                    raise HTTPException(503, "Database is unavailable; please retry") from exc
+                if lock_conn is None:
+                    raise HTTPException(409, "This image is already being processed")
+            task = asyncio.create_task(_process_image(
+                request, file, image_id=image_id, ground_truth=ground_truth, model=model))
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                # Keep the lock and processing slot until background work finishes.
+                await task
+                raise
+        finally:
+            if lock_conn is not None:
+                await asyncio.shield(asyncio.to_thread(service.release_processing_lock, lock_conn, image_id))
 
 
 app.include_router(router)

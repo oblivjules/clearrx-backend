@@ -455,6 +455,83 @@ class ImageProcessor:
 
     # ── Multi-pass handwriting enhancement ────────────────────────────────────
 
+    def remove_shadows(self, img: np.ndarray) -> np.ndarray:
+        """Flatten document lighting while preserving ink edges and geometry.
+
+        This follows a document-scanner style pipeline: denoise the luminance
+        channel, estimate only the broad illumination field, divide out that
+        field, and restore a small amount of local contrast. The correction is
+        limited around dark edges so handwriting and thin numerals are not
+        mistaken for shadows.
+        """
+        if img is None or img.size == 0:
+            raise ValueError("image must be a non-empty array")
+
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape
+        denoised = cv2.bilateralFilter(gray, d=5, sigmaColor=18, sigmaSpace=18)
+        kernel = max(31, min(h, w) // 7)
+        if kernel % 2 == 0:
+            kernel += 1
+        background = cv2.GaussianBlur(
+            denoised, (0, 0), sigmaX=max(14.0, kernel / 3.0)
+        )
+        background = np.maximum(background.astype(np.float32), 1.0)
+
+        low, high = np.percentile(background, (10, 90))
+        shadow_range = max(0.0, float(high - low))
+        strength = float(np.clip((shadow_range - 8.0) / 48.0, 0.0, 0.82))
+        if strength <= 0.01:
+            return img.copy()
+
+        target = float(np.clip(np.percentile(background, 82), 180.0, 242.0))
+        corrected_gray = np.clip(
+            denoised.astype(np.float32) * (target / background), 0.0, 255.0
+        )
+
+        # Strong local dark contrast is likely ink, not illumination. Keep most
+        # of the original luminance there to avoid thinning handwritten strokes.
+        ink_like = np.clip(
+            (background - denoised.astype(np.float32) - 22.0) / 48.0, 0.0, 1.0
+        )
+        pixel_strength = strength * (1.0 - 0.70 * ink_like)
+        corrected_gray = (
+            denoised.astype(np.float32) * (1.0 - pixel_strength)
+            + corrected_gray * pixel_strength
+        )
+
+        # CamScanner-like paper lift without a hard threshold: CLAHE recovers
+        # faint strokes in uneven light, while blending keeps noise controlled.
+        corrected_u8 = np.clip(corrected_gray, 0, 255).astype(np.uint8)
+        clahe = cv2.createCLAHE(clipLimit=1.35, tileGridSize=(8, 8))
+        local_contrast = clahe.apply(corrected_u8)
+        corrected_u8 = cv2.addWeighted(corrected_u8, 0.72, local_contrast, 0.28, 0)
+
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        lab[:, :, 0] = corrected_u8
+        return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+    def create_document_preview(self, img: np.ndarray) -> np.ndarray:
+        """Create a clean white-paper preview without changing image geometry."""
+        if img is None or img.size == 0:
+            raise ValueError("image must be a non-empty array")
+
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        denoised = cv2.bilateralFilter(gray, d=5, sigmaColor=20, sigmaSpace=20)
+        h, w = gray.shape
+        sigma = max(14.0, min(h, w) / 22.0)
+        background = cv2.GaussianBlur(denoised, (0, 0), sigmaX=sigma)
+        background = np.maximum(background.astype(np.float32), 1.0)
+
+        # Divide out only low-frequency illumination. Ink remains dark because
+        # its local contrast is much stronger than the broad shadow field.
+        paper = np.clip(denoised.astype(np.float32) / background * 255.0, 0, 255)
+        paper = np.clip((paper - 8.0) * 1.04, 0, 255).astype(np.uint8)
+        clahe = cv2.createCLAHE(clipLimit=1.1, tileGridSize=(8, 8))
+        local = clahe.apply(paper)
+        preview = cv2.addWeighted(paper, 0.82, local, 0.18, 0)
+        return cv2.cvtColor(preview, cv2.COLOR_GRAY2BGR)
+
     def enhance_for_handwriting(self, img: np.ndarray) -> tuple[np.ndarray, int, int]:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 

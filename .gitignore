@@ -1,4 +1,5 @@
 # Local environments and secrets
+.private/
 .env
 .env.*
 !.env.example
@@ -24,6 +25,7 @@ hf_cache/
 *.pth
 
 # Local data, databases, and logs
+CleaRx-backend/storage/
 *.db
 *.sqlite
 *.sqlite3

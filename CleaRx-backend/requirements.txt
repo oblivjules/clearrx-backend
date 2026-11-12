@@ -30,3 +30,6 @@ psycopg2-binary>=2.9.0
 # CER measurement is critical for Objective 2.2 validation (target: CER ≤ 20%)
 #A Library for fast computation of Levenshtein distance and string similarity metrics
 Levenshtein>=0.23.0
+
+# Recognition provider SDK
+anthropic>=0.40.0

@@ -1,4 +1,5 @@
 import os
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -13,14 +14,17 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture
-def capture_session():
+def capture_session(monkeypatch):
     from db import DatabaseService
 
+    profile_id = os.getenv("TEST_PROFILE_ID")
+    if not profile_id:
+        pytest.skip("Set TEST_PROFILE_ID to an existing isolated test profile UUID")
+    uuid.UUID(profile_id)
+    monkeypatch.setenv("DATABASE_URL", TEST_DATABASE_URL)
     service = DatabaseService()
-    old_database_url = os.environ.get("DATABASE_URL")
-    os.environ["DATABASE_URL"] = TEST_DATABASE_URL
     session_id = service.create_capture_session(
-        user_id="capture-attempt-test",
+        user_id=profile_id,
         image_source="test",
     )
     try:
@@ -29,13 +33,14 @@ def capture_session():
         with service._get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
+                    'DELETE FROM "PRESCRIPTION_IMAGE" WHERE session_id = %s',
+                    (session_id,),
+                )
+                cur.execute(
                     'DELETE FROM "CAPTURE_SESSION" WHERE session_id = %s',
                     (session_id,),
                 )
-        if old_database_url is None:
-            os.environ.pop("DATABASE_URL", None)
-        else:
-            os.environ["DATABASE_URL"] = old_database_url
+        service.close()
 
 
 def test_three_captures_allocate_attempts_and_total(capture_session):
