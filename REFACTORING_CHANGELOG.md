@@ -73,6 +73,26 @@ achievement of post-refactoring outcome targets.
   pinned/latest snapshot loading, startup fallback, API conflict metadata and
   mocked nullable-product persistence. Backend import and `git diff --check`
   passed. No real database/model calls, schema changes or accuracy benchmarks.
+- Commit: `ef3d658` — `feat(catalog): integrate product matching and formulation checks`.
+
+## B4 — Critical-field uncertainty and dose provenance
+
+- Priorities: #2 recognition/critical-field reliability and #4 review guidance.
+- Migrated rational fractional/decimal dose arithmetic, invalid-dose review flags,
+  stated-duration precedence and restrictions on quantity-derived durations.
+  Variable schedules and drop quantities are not extrapolated into durations.
+- Preserve uncertainty markers through extraction, normalize marker case/spacing,
+  and flag cutoff text even when truncation hides the exact missing field.
+- Any uncertain field now marks the medicine for review while preserving field
+  scope. Retained the existing parser-test name; only its changed review-policy
+  assertion was migrated. Route provenance and shared result policy landed in B3.
+- Added parser/review safety regressions and mocked persistence checks. Upload
+  limits and runtime policy tests remain in their later migration steps.
+- Verification: `python -m pytest tests -q` — 67 passed, 2 skipped
+  (opt-in capture database tests). Covers fractional/decimal/invalid doses,
+  stated-duration precedence, variable schedules, cutoff/uncertainty markers
+  and review flags reaching mocked persistence. `git diff --check` passed.
+  No real database/model calls or accuracy benchmarks were performed.
 - Commit: pending explicit user approval.
 
 Run from CleaRx-backend with `python -m pytest tests -q`. Without explicit test
