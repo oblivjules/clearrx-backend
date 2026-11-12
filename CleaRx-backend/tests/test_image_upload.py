@@ -48,11 +48,13 @@ def test_invalid_mime_corruption_and_limits(monkeypatch):
 @pytest.mark.parametrize('endpoint', ['/preview-check', '/capture-image', '/upload-file',
                                       '/validate-capture', '/validate-upload', '/process-image'])
 def test_all_image_endpoints_use_bounded_decoding(monkeypatch, endpoint):
+    from db import _db_service
     monkeypatch.setattr(main, '_DB_AVAILABLE', True)
     monkeypatch.setattr(main, '_db_prescription_image_exists', lambda **kw: True)
     monkeypatch.setattr(main, '_db_has_completed_transcription_result', lambda **kw: False)
     monkeypatch.setattr(image_upload, 'MAX_BYTES', 2)
-    # The existing processing status update is mocked; persistence changes are B8.
+    monkeypatch.setattr(_db_service, 'acquire_processing_lock', Mock(return_value=object()))
+    monkeypatch.setattr(_db_service, 'release_processing_lock', Mock())
     monkeypatch.setattr(main, '_db_update_image_status', Mock())
     client = TestClient(main.app)
     try:

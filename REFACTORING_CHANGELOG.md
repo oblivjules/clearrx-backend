@@ -163,6 +163,34 @@ achievement of post-refactoring outcome targets.
   uniform-light no-op behavior, geometry/contrast/input preservation, and preview
   versus recognition image selection for provider/local success/no-text paths.
   `git diff --check` passed. No live database/OCR or accuracy benchmarks were run.
+- Commit: `f148764` — `feat(images): add shadow correction and document previews`.
+
+## B8 — Bounded processing and explicit persistence outcomes
+
+- Supporting priorities #2–#4: reliability of recognition, capture identity and
+  result/review status. Migrated bounded connection pooling, transaction advisory
+  image locks, byte/checksum identity and saved-result duplicate protection.
+- Limit expensive processing to two requests per worker. Offload blocking image,
+  database, parsing and matching calls; report stage timing diagnostics. Preserve
+  approved OCR naming/routing and shared camera/upload acceptance policy.
+- Required match/structured writes return a completeness result. Mark images
+  processed only after saving; expose failed saving separately from a successful
+  reading, including final status-write failures. Whole-result atomicity/replay
+  remain outstanding and are not implied by these changes.
+- Keep locks until active processing finishes on cancellation. Also collect and
+  release lock tokens if cancellation occurs while acquisition runs in a thread.
+- Added local/test startup guard and configured CORS origins. Close pooled
+  connections on shutdown. Adapted database test doubles to connection injection
+  and close capture-test pools before restoring their isolated environment.
+- Added OPERATIONS.md recording real configuration, schema/retention limitations
+  and unverified deployment requirements. No SQL migration or live database
+  change was executed; frontend changes remain in the subsequent sequence.
+- Verification: `python -m pytest tests -q` — 145 passed, 2 skipped
+  (opt-in capture database tests). Includes pooling, transaction-lock release,
+  cancellation during acquisition/processing, concurrency limits, pre-OCR
+  duplicate/checksum rejection, partial writes and completion-status failures.
+  `git diff --check` passed. No live database/provider calls, deployment or
+  accuracy/calibration benchmarks were performed.
 - Commit: pending explicit user approval.
 
 Run from CleaRx-backend with `python -m pytest tests -q`. Without explicit test

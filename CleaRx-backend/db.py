@@ -2,17 +2,39 @@ from __future__ import annotations
 
 import os
 import hashlib
+import threading
 from datetime import datetime, timezone
 from contextlib import contextmanager
 
 import psycopg2
 from psycopg2.extras import execute_values
+from psycopg2.pool import ThreadedConnectionPool
 
 
 class DatabaseService:
+    def __init__(self, connection_factory=None):
+        self._connection_factory = connection_factory
+        self._pool = None
+        self._pool_lock = threading.Lock()
+
+    def _connection_pool(self):
+        with self._pool_lock:
+            if self._pool is None:
+                self._pool = ThreadedConnectionPool(
+                    1, max(4, int(os.getenv('DB_POOL_SIZE', '8'))),
+                    dsn=os.getenv('DATABASE_URL'), sslmode='require', connect_timeout=10)
+        return self._pool
+
+    def close(self):
+        with self._pool_lock:
+            if self._pool is not None:
+                self._pool.closeall()
+                self._pool = None
+
     @contextmanager
     def _get_conn(self):
-        conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode="require")
+        pool = None if self._connection_factory else self._connection_pool()
+        conn = self._connection_factory() if self._connection_factory else pool.getconn()
         try:
             yield conn
             conn.commit()
@@ -20,7 +42,34 @@ class DatabaseService:
             conn.rollback()
             raise
         finally:
-            conn.close()
+            if pool is None:
+                conn.close()
+            else:
+                pool.putconn(conn, close=bool(conn.closed))
+
+    def acquire_processing_lock(self, image_id):
+        """Transaction advisory lock serializes one image across backend workers."""
+        pool = self._connection_pool()
+        conn = pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute('SELECT pg_try_advisory_xact_lock(hashtextextended(%s, 0))', (image_id,))
+                acquired = cur.fetchone()[0]
+            if not acquired:
+                conn.rollback()
+                pool.putconn(conn)
+                return None
+            return conn
+        except Exception:
+            conn.rollback()
+            pool.putconn(conn, close=bool(conn.closed))
+            raise
+
+    def release_processing_lock(self, conn, image_id):
+        try:
+            conn.rollback()  # Releases transaction lock, including on failure.
+        finally:
+            self._connection_pool().putconn(conn, close=bool(conn.closed))
 
     def check_connection(self) -> None:
         with self._get_conn() as conn:
@@ -60,7 +109,6 @@ class DatabaseService:
                     dosage_form, routes, is_veterinary FROM public.drug_products
                     WHERE import_id = %s AND NOT is_veterinary''', (import_id,))
                 return str(import_id), [dict(row) for row in cur.fetchall()]
-
 
     def create_capture_session(
         self,
@@ -194,6 +242,13 @@ class DatabaseService:
                 )
                 return cur.fetchone() is not None
 
+    def prescription_image_matches(self, *, image_id: str, image_bytes: bytes) -> bool:
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute('SELECT checksum FROM "PRESCRIPTION_IMAGE" WHERE image_id = %s', (image_id,))
+                row = cur.fetchone()
+                return bool(row and row[0] == hashlib.sha256(image_bytes).hexdigest())
+
     def has_completed_transcription_result(self, *, image_id: str) -> bool:
         with self._get_conn() as conn:
             with conn.cursor() as cur:
@@ -205,8 +260,11 @@ class DatabaseService:
                       ON j.preprocessing_id = p.preprocessing_id
                     JOIN "TRANSCRIPTION_OUTPUTS" o
                       ON o.job_id = j.job_id
+                    JOIN structured_prescription s ON s.output_id = o.output_id
                     WHERE p.image_id = %s
-                      AND j.job_status = 'completed'
+                      AND j.job_status = 'completed' AND o.output_status = 'completed'
+                      AND EXISTS (SELECT 1 FROM "PRESCRIPTION_IMAGE" i
+                                  WHERE i.image_id = p.image_id AND i.capture_status = 'processed')
                     LIMIT 1
                     """,
                     (image_id,),

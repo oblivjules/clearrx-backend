@@ -60,7 +60,7 @@ def test_output_and_fields_share_one_transaction(monkeypatch):
 
     monkeypatch.setattr(db, "execute_values", execute_values)
 
-    output_id, field_ids = db.DatabaseService().create_transcription_output_with_fields(
+    output_id, field_ids = db.DatabaseService(connection_factory=lambda: connection).create_transcription_output_with_fields(
         job_id="job-1",
         raw_text="raw",
         overall_confidence=0.9,

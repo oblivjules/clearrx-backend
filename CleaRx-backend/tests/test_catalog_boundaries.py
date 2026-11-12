@@ -145,10 +145,9 @@ def test_database_writes_nullable_product_references(monkeypatch, product_id):
     connection.__enter__.return_value = connection
     cursor = connection.cursor.return_value.__enter__.return_value
     cursor.fetchone.return_value = ('prescription-1',)
-    monkeypatch.setattr(db.psycopg2, 'connect', Mock(return_value=connection))
     insert = Mock(side_effect=[[('match-1', 'field-1')], None, [('line-1', 1)]])
     monkeypatch.setattr(db, 'execute_values', insert)
-    service = db.DatabaseService()
+    service = db.DatabaseService(connection_factory=lambda: connection)
     service.persist_drug_matches(matches=[dict(
         raw_input='Example', field_id='field-1', is_flagged=False, product_id=product_id,
         original_token='Example', corrected_token='Amoxicillin', token_sort_ratio=None,

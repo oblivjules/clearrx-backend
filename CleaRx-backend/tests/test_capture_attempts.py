@@ -40,6 +40,7 @@ def capture_session(monkeypatch):
                     'DELETE FROM "CAPTURE_SESSION" WHERE session_id = %s',
                     (session_id,),
                 )
+        service.close()
 
 
 def test_three_captures_allocate_attempts_and_total(capture_session):
