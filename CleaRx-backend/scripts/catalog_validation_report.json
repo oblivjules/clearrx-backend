@@ -1,0 +1,36 @@
+{
+  "source_name": "complete_fda_drugs.csv",
+  "source_sha256": "41a0c0d06d2d27757066c992857410ab8568063e3ac9efb0f9189cc59d002202",
+  "normalization_version": 1,
+  "record_count": 49943,
+  "populated_fields": {
+    "drug_id": 49943,
+    "brand_name": 43052,
+    "common_ocr_variants": 49943,
+    "therapeutic_class": 35472,
+    "rx_status": 42175,
+    "ph_fda_number": 42086,
+    "dosage_strength": 34536,
+    "dosage_form": 34689,
+    "route_of_administration": 32609,
+    "generic_name": 43701
+  },
+  "quality_flags": {
+    "missing_generic_name": 6242,
+    "missing_dosage_strength": 15407,
+    "missing_dosage_form": 15254,
+    "missing_route_of_administration": 17334,
+    "missing_ph_fda_number": 7857,
+    "veterinary_indicator": 2353,
+    "placeholder_generic": 54
+  },
+  "unique_aliases": 192842,
+  "aliases_shared_by_multiple_records": 29371,
+  "brand_names_with_multiple_records": 5501,
+  "errors": [],
+  "notes": [
+    "Shared aliases are candidate sets, not necessarily data errors.",
+    "Veterinary indicators are heuristic; records are retained and flagged.",
+    "No source registration validity or clinical correctness is verified."
+  ]
+}
