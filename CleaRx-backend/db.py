@@ -43,6 +43,25 @@ class DatabaseService:
                     for drug_id, name, drug_type, is_discontinued in cur.fetchall()
                 ]
 
+    def fetch_product_catalog(self):
+        from psycopg2.extras import RealDictCursor
+        requested = os.getenv('DRUG_CATALOG_IMPORT_ID')
+        with self._get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                if requested:
+                    cur.execute('SELECT import_id FROM public.drug_catalog_imports WHERE import_id = %s', (requested,))
+                else:
+                    cur.execute('SELECT import_id FROM public.drug_catalog_imports ORDER BY imported_at DESC, import_id LIMIT 1')
+                selected = cur.fetchone()
+                if not selected:
+                    raise ValueError('No matching drug catalog import exists')
+                import_id = selected['import_id']
+                cur.execute('''SELECT product_id, brand_name, generic_name, dosage_strength,
+                    dosage_form, routes, is_veterinary FROM public.drug_products
+                    WHERE import_id = %s AND NOT is_veterinary''', (import_id,))
+                return str(import_id), [dict(row) for row in cur.fetchall()]
+
+
     def create_capture_session(
         self,
         *,
@@ -477,7 +496,7 @@ class DatabaseService:
                     """
                     INSERT INTO drug_match_results
                         (raw_input, matched_name, match_score, field_id, lexicon_id,
-                         match_type, is_flagged, flag_reason)
+                         match_type, is_flagged, flag_reason, product_id)
                     VALUES %s
                     RETURNING match_id, field_id
                     """,
@@ -486,7 +505,7 @@ class DatabaseService:
                             item["raw_input"], item.get("matched_name"),
                             item.get("raw_score"), item["field_id"],
                             item.get("lexicon_id"), item.get("match_type"),
-                            item["is_flagged"], item.get("flag_reason"),
+                            item["is_flagged"], item.get("flag_reason"), item.get("product_id"),
                         )
                         for item in matches
                     ],
@@ -548,7 +567,7 @@ class DatabaseService:
                          lexicon_id, dosage, frequency, route, duration, quantity,
                          line_item_status, brand_name, strength, dosage_form,
                          dose_amount, timing, meal_relation,
-                         administration_instructions, duration_source)
+                         administration_instructions, duration_source, product_id)
                     VALUES %s
                     RETURNING line_item_id, item_order
                     """,
@@ -563,7 +582,7 @@ class DatabaseService:
                             item.get("dose_amount"), item.get("timing"),
                             item.get("meal_relation"),
                             item.get("administration_instructions"),
-                            item.get("duration_source"),
+                            item.get("duration_source"), item.get("product_id"),
                         )
                         for item in line_items
                     ],

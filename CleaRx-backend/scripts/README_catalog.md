@@ -107,7 +107,34 @@ duplicate import and rollback behavior. PostgreSQL execution, foreign keys,
 RLS and a full-size source import still require disposable-database verification.
 No accuracy benchmarks or calibration reports were added.
 
-B2 prepares import infrastructure only. The running backend continues to use
-its existing matching implementation. Catalog loading, matching and product
-reference persistence are introduced in B3; rerunning this migration is not
-part of that integration.
+B2 prepares import infrastructure; B3 integrates the running backend as below.
+Rerunning the migration is not part of that integration.
+
+## Backend integration — B3
+
+Startup loads human product records from `drug_products`. Set
+`DRUG_CATALOG_IMPORT_ID` to pin an import UUID; otherwise it selects the newest
+snapshot by import timestamp. For the supplied export, the import UUID is
+`f669f862-76ff-4ee2-878a-746cf57d4e76`. Restart after changing this setting or
+importing a catalog. Startup logs the loaded snapshot ID. If catalog loading
+fails, legacy matching remains available without product field checks.
+
+Matching uses exact main brand/generic names before fuzzy candidates, caches
+lookups, excludes veterinary records and checks observed strength, form and
+route against candidate formulations. Unknown values remain unknown. Inferred
+oral routes are identified as inferred and excluded from observed route evidence.
+Neither catalog data nor missing values supply prescription instructions.
+
+A matched name does not guarantee a resolved formulation. `product_id` is
+nullable and populated only for a uniquely resolved formulation with matching
+strength and no conflicts. Both drug-match and prescription-line records retain
+this reference; existing legacy lexicon IDs remain separate. Per-medicine API
+metadata includes `catalog_import_id`, `name_similarity`, `name_matched`,
+`field_validation`, `formulation_status`, `review_required` and review reasons.
+Internal candidate/matching helpers are removed from public medicine objects.
+Unmatched OCR names remain visible for review rather than being discarded.
+
+Known limits remain: main-name matching does not use stored OCR aliases or
+canonicalize ingredient order, complex combination strengths are unknown, and
+unresolved matches do not have a dedicated persisted catalog-import reference.
+No recognition accuracy or clinical validation is implied by regression tests.

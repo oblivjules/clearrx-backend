@@ -12540,7 +12540,29 @@ class DrugValidator:
             "algorithm_used": best_algorithm,
         }
 
-    def validate_drug_name(self, raw_text: str) -> dict[str, object]:
+    _product_catalog = None
+
+    @classmethod
+    def use_product_catalog(cls, catalog):
+        cls._product_catalog = catalog
+        names = {}
+        brands = {}
+        for product in catalog.products.values():
+            generic, brand = product['generic_name'], product['brand_name']
+            for name in (generic, brand):
+                if name:
+                    names.setdefault(name.lower(), name)
+            if brand:
+                brands.setdefault(brand.lower(), set()).add(generic or brand)
+        cls.use_database_catalog([(name, 'generic') for name in names.values()])
+        # Only unambiguous brand-to-ingredient relationships enter parser lookup.
+        cls._BRAND_TO_GENERIC = {b: next(iter(g)) for b, g in brands.items() if len(g) == 1}
+        cls._BRAND_KEYS = list(cls._BRAND_TO_GENERIC)
+        cls._BRAND_SET = frozenset(cls._BRAND_KEYS)
+
+    def validate_drug_name(self, raw_text: str, **context) -> dict[str, object]:
+        if self._product_catalog is not None:
+            return self._product_catalog.match(raw_text, **context)
         result = self._validate_drug_name(raw_text)
         matched = bool(result.get("matched"))
         match_type = result.get("match_type")

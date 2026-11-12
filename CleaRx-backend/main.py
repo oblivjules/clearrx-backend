@@ -26,6 +26,7 @@ from image_processor import ImageProcessor
 from trocr_service import run_trocr_ocr
 from drug_validator import validate_drug_name, DrugValidator
 from parser import parse_prescription, refresh_drug_catalog, _drug_name_passes_sanity
+from result_policy import extracted_fields, apply_match_review, public_medicine
 
 try:
     from db import check_database_connection as _check_database_connection
@@ -351,11 +352,7 @@ def _persist_module_2(
         cursor = 0
         field_sequence = 0
         for medicine in raw_medicines or medicines:
-            for field_name, value in medicine.items():
-                if field_name.startswith("_"):
-                    continue
-                if value is None:
-                    continue
+            for field_name, value in extracted_fields(medicine):
                 field_value = str(value)
                 start = raw_text.find(field_value, cursor)
                 if start < 0:
@@ -404,15 +401,12 @@ def _persist_modules_3_4(
         for index, medicine in enumerate(raw_medicines):
             raw_drug = medicine.get("_drug_name_raw") or medicine.get("drug_name")
             if not raw_drug:
-                field_sequence += sum(
-                    value is not None and not name.startswith("_")
-                    for name, value in medicine.items()
-                )
+                field_sequence += len(extracted_fields(medicine))
                 continue
             result = (
                 {}
                 if medicine.get("_drug_name_is_class")
-                else validate_drug_name(str(raw_drug))
+                else medicine.get("_drug_validation") or validate_drug_name(str(raw_drug))
             )
             _persist_drug_validation(
                 image_id=image_id,
@@ -426,14 +420,17 @@ def _persist_modules_3_4(
                 or not result.get("matched")
                 or float(fuzzy_score or 0.0) < LOW_MATCH_CONFIDENCE
             )
-            reasons = []
+            flagged = flagged or bool(result.get("review_reasons"))
+            reasons = list(result.get("review_reasons") or [])
             if not result.get("matched"):
                 reasons.append("no_lexicon_match")
             if result.get("matched") and float(fuzzy_score or 0.0) < LOW_MATCH_CONFIDENCE:
                 reasons.append("low_match_score")
             if ocr_confidence < LOW_OCR_CONFIDENCE:
                 reasons.append("low_ocr_confidence")
-            field_id = field_ids.get(field_sequence)
+            field_order = [name for name, _ in extracted_fields(medicine)]
+            drug_offset = field_order.index("drug_name") if "drug_name" in field_order else None
+            field_id = field_ids.get(field_sequence + drug_offset) if drug_offset is not None else None
             if field_id:
                 match_rows.append({
                     "raw_input": str(raw_drug),
@@ -441,6 +438,7 @@ def _persist_modules_3_4(
                     "raw_score": result.get("raw_score"),
                     "field_id": field_id,
                     "lexicon_id": _LEXICON_ID_BY_NAME.get(str(matched_name or "").lower(), (None, False))[0],
+                    "product_id": medicine.get("_product_id"),
                     "match_type": result.get("match_type"),
                     "is_flagged": flagged,
                     "flag_reason": ",".join(reasons) or None,
@@ -452,10 +450,7 @@ def _persist_modules_3_4(
                     "score_cutoff_used": result.get("score_cutoff_used"),
                     "correction_applied": bool(matched_name and matched_name != raw_drug),
                 })
-            field_sequence += sum(
-                value is not None and not name.startswith("_")
-                for name, value in raw_by_index[index].items()
-            )
+            field_sequence += len(extracted_fields(raw_by_index[index]))
         _db_persist_drug_matches(matches=match_rows)
     except Exception as exc:
         logger.error("drug matching persistence failed (image_id=%s, output_id=%s, step=matches): %s", image_id, output_id, exc)
@@ -469,7 +464,7 @@ def _persist_modules_3_4(
             result = (
                 {}
                 if raw.get("_drug_name_is_class")
-                else validate_drug_name(str(raw_drug or "")) if raw_drug else {}
+                else medicine.get("_drug_validation") or (validate_drug_name(str(raw_drug or "")) if raw_drug else {})
             )
             matched = bool(result.get("matched"))
             fuzzy = float(result.get("confidence") or 0.0) if matched else None
@@ -481,7 +476,7 @@ def _persist_modules_3_4(
             }
             marker_fields = set(medicine.get("_marker_fields") or [])
             fields = []
-            for name, value in medicine.items():
+            for name, value in extracted_fields(medicine):
                 if (
                     name.startswith("_")
                     or name in {
@@ -496,7 +491,7 @@ def _persist_modules_3_4(
                     0.5 * ocr_confidence + 0.5 * (fuzzy_value or 0.0)
                     if name in {"drug_name", "brand_name"} else ocr_confidence
                 )
-                if name in marker_fields:
+                if name in marker_fields or result.get("field_validation", {}).get(name) == "conflict":
                     composite = min(composite, UNCERTAIN_FIELD_SCORE_CAP)
                 fields.append({
                     "field_name": name,
@@ -508,6 +503,7 @@ def _persist_modules_3_4(
                 })
             line_items.append({
                 "item_order": index + 1,
+                "product_id": medicine.get("_product_id"),
                 "drug_name_raw": raw_drug,
                 "drug_name_matched": medicine.get("drug_name") if matched else None,
                 "lexicon_id": _LEXICON_ID_BY_NAME.get(str(medicine.get("drug_name") or "").lower(), (None, False))[0],
@@ -612,6 +608,21 @@ async def lifespan(app: FastAPI):
                 print(f"[startup] Drug catalog: {catalog_size} names loaded from Supabase")
             else:
                 print("[startup] Drug catalog: empty; using legacy local lexicon")
+            try:
+                from db import _db_service
+                from product_catalog import ProductCatalog
+                import_id, products = _db_service.fetch_product_catalog()
+                catalog = ProductCatalog(products, import_id)
+                if not catalog.products or not catalog.name_products:
+                    raise ValueError("Selected product catalog has no usable human products")
+                DrugValidator.use_product_catalog(catalog)
+                refresh_drug_catalog()
+                print(
+                    f"[startup] Product catalog: {len(catalog.products)} human records, "
+                    f"{len(catalog.name_products)} brand/generic names (import {import_id})"
+                )
+            except Exception:
+                logger.exception("Product catalog unavailable; retaining legacy name matching")
             print("[startup] Supabase database: connected")
         except Exception as exc:
             print(f"[startup] Supabase database: connection/catalog failed ({exc})")
@@ -1142,16 +1153,26 @@ async def process_image(
     ocr_source = ocr_provider
 
     drug_validations = []
-    for m in medicines:
-        dn = m.get("drug_name")
+    for medicine_index, m in enumerate(medicines):
+        dn = m.get("drug_name") or m.get("drug_name_raw")
         if dn:
-            dv = validate_drug_name(dn)
+            dv = validate_drug_name(
+                raw_medicines[medicine_index].get("_drug_name_raw") or m.get("drug_name_raw") or dn, brand_name=m.get("brand_name"),
+                strength_value=m.get("strength"), dosage_form=m.get("dosage_form"),
+                route_value=m.get("route_of_administration") if m.get("route_source") == "stated" else None)
+            m["_drug_validation"] = dv
+            m["_product_id"] = dv.get("product_id")
+            raw_medicines[medicine_index]["_drug_validation"] = dv
+            raw_medicines[medicine_index]["_product_id"] = dv.get("product_id")
+            m["_catalog_match"] = {k: dv.get(k) for k in (
+                "product_id", "catalog_import_id", "candidates", "field_validation", "review_reasons")}
+            apply_match_review(m, dv)
             drug_validations.append(dv)
             if dv["matched"]:
                 m["drug_name"] = dv["corrected"]
             else:
-                print(f"[main] Discarded unvalidated drug name: {dn!r}")
-                m["drug_name"] = None
+                logger.info("Drug name requires review (request_id=%s)", request_id)
+                m["drug_name"] = dv.get("original") or dn
                 m["uncertain"] = True
 
     first_brand   = medicines[0].get("brand_name") if medicines else None
@@ -1255,7 +1276,9 @@ async def process_image(
         "brand_name":         first_brand or drug_validation["original"],
         "drug_confidence":    drug_validation["confidence"],
         "drug_matched":       drug_validation["matched"],
-        "medicines":          medicines,
+        "medicines":          [public_medicine(m) for m in medicines],
+        "name_similarity":    drug_validation.get("raw_score"),
+        "review_required":    any(m.get("review_required") or m.get("uncertain") for m in medicines),
         "ocr_source":         ocr_source,
         "cer":                cer_result,
         **({"ocr_error": ocr_error} if ocr_error else {}),

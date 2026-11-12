@@ -48,6 +48,31 @@ achievement of post-refactoring outcome targets.
   (opt-in capture database tests). Import tests cover CSV validation, dry run,
   mocked transaction success/error handling and duplicate-source no-op behavior.
   `git diff --check` passed. No PostgreSQL migration or real import was run.
+- Commit: `9918b46` — `feat(catalog): add versioned product catalog imports`.
+
+## B3 — Product matching and formulation checks
+
+- Priorities: #5 catalog integration, supporting #2 field reliability and #4
+  review metadata. B2 commit: `9918b46`.
+- Migrated product matching/cache, startup snapshot selection, brand/generic
+  indexes and parser integration. Catalog failures retain legacy name matching.
+- Propagated catalog field conflicts, uncertain fields, name similarity and
+  nullable resolved-product references to API/persistence. Reuse the same match
+  result for response and storage; keep metadata out of transcribed-field rows.
+- Preserved numeric brands and separate unmatched medicines with their own sig.
+  Retained unmatched OCR names for review and removed private helper fields from
+  public medicine objects.
+- Moved route provenance into B3 as a dependency of formulation checks: inferred
+  routes must not be treated as observed catalog evidence. Remaining parser
+  dose/uncertainty changes stay in B4. Pooling and persistence outcomes stay in B8.
+- Known matching limits: unused OCR aliases, no ingredient-order canonicalization,
+  no complex combination-strength parsing. Catalog counts and live database
+  compatibility remain unverified beyond the supplied schema/sample evidence.
+- Verification: `python -m pytest tests -q` — 48 passed, 2 skipped
+  (opt-in database capture tests). Includes product matching, parser integration,
+  pinned/latest snapshot loading, startup fallback, API conflict metadata and
+  mocked nullable-product persistence. Backend import and `git diff --check`
+  passed. No real database/model calls, schema changes or accuracy benchmarks.
 - Commit: pending explicit user approval.
 
 Run from CleaRx-backend with `python -m pytest tests -q`. Without explicit test
