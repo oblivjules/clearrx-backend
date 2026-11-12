@@ -93,6 +93,29 @@ achievement of post-refactoring outcome targets.
   stated-duration precedence, variable schedules, cutoff/uncertainty markers
   and review flags reaching mocked persistence. `git diff --check` passed.
   No real database/model calls or accuracy benchmarks were performed.
+- Commit: `9eacb0c` — `fix(parser): preserve critical-field uncertainty and dose provenance`.
+
+## B5 — Shared image validation and persistent uploads
+
+- Priority: #3 capture/upload alternatives and shared quality acceptance.
+- Migrated bounded JPEG/PNG/WebP decoding, upload/crop-validation/file-retrieval
+  endpoints, camera file storage and database file-path access. Added the default
+  storage directory to the repository-root ignore file.
+- Extracted one camera/upload quality policy. As approved, framing stays advisory
+  for both sources; the refactored upload-only framing gate was not migrated.
+  Lighting, blur, readability and handwriting thresholds remain unchanged.
+- Retained attempt/metric recording for registered uploads, including rejected
+  attempts. Crop checks have no storage or database side effects. Registration
+  failures remove the newly written file; retrieval enforces storage containment.
+- Added IMAGE_UPLOAD.md documenting endpoints and real retention limitations:
+  no automatic deletion/masking, no ownership authentication, and no atomic disk/
+  database transaction. Production deployment and privacy notice work are not
+  claimed complete. No new SQL migration or database writes were performed.
+- Verification: `python -m pytest tests -q` — 98 passed, 2 skipped
+  (opt-in capture database tests). Includes camera/upload parity under controlled
+  conditions and real checks on generated images, all six image endpoint byte
+  limits, supported formats, MIME/pixel limits, storage cleanup and retrieval
+  containment. `git diff --check` passed. No real database or OCR calls were made.
 - Commit: pending explicit user approval.
 
 Run from CleaRx-backend with `python -m pytest tests -q`. Without explicit test

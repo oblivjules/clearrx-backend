@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, Mock
 import numpy as np
 import pytest
 from PIL import Image
-from starlette.datastructures import UploadFile
+from starlette.datastructures import Headers, UploadFile
 from starlette.requests import Request
 
 import db
@@ -102,7 +102,9 @@ def test_process_emits_catalog_conflicts_without_private_metadata(monkeypatch, c
     Image.new('RGB', (8, 8)).save(stream, 'PNG')
     stream.seek(0)
     result = asyncio.run(main.process_image(
-        Request({'type': 'http', 'headers': []}), UploadFile(stream, filename='test.png'), None, None))
+        Request({'type': 'http', 'headers': []}),
+        UploadFile(stream, filename='test.png', headers=Headers({'content-type': 'image/png'})),
+        None, None))
     medicine = result['medicines'][0]
     assert result['status'] == 'success'
     assert result['review_required']

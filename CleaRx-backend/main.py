@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, APIRouter, Request
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
@@ -34,6 +35,7 @@ try:
     from db import log_validate_capture as _db_log_validate_capture
     from db import create_capture_session as _db_create_capture_session
     from db import create_prescription_image as _db_create_prescription_image
+    from db import get_prescription_image_path as _db_get_prescription_image_path
     from db import update_prescription_image_status as _db_update_image_status
     from db import prescription_image_exists as _db_prescription_image_exists
     from db import has_completed_transcription_result as _db_has_completed_transcription_result
@@ -573,6 +575,9 @@ def _persist_drug_validation(
 # ── Service singletons ─────────────────────────────────────────────────────────
 _img_proc = ImageProcessor()
 _LEXICON_ID_BY_NAME: dict[str, tuple[str, bool]] = {}
+_STORAGE_ROOT = Path(
+    os.getenv("FILE_STORAGE_DIR", str(Path(__file__).resolve().parent / "storage"))
+).resolve()
 
 
 # ── Lifespan ───────────────────────────────────────────────────────────────────
@@ -647,16 +652,240 @@ router = APIRouter()
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
+async def _read_validated_image(file: UploadFile) -> tuple[bytes, np.ndarray, str]:
+    from image_upload import MAX_BYTES, decode_image
+    raw = await file.read(MAX_BYTES + 1)
+    try:
+        image, suffix = await asyncio.to_thread(decode_image, raw, file.content_type)
+    except HTTPException as exc:
+        logger.warning("Image upload rejected: HTTP %s, %s", exc.status_code, exc.detail)
+        raise
+    return raw, image, suffix
+
+
+@router.post("/upload-file")
+async def upload_file(
+    file: UploadFile = File(...),
+    session_id: str = Form(...),
+):
+    if not _DB_AVAILABLE:
+        raise HTTPException(status_code=503, detail="database unavailable")
+
+    raw, image, suffix = await _read_validated_image(file)
+    image_id: str | None = None
+    stored_path: Path | None = None
+    try:
+        _STORAGE_ROOT.mkdir(parents=True, exist_ok=True)
+        stored_path = _STORAGE_ROOT / f"{uuid.uuid4()}{suffix}"
+        stored_path.write_bytes(raw)
+        image_id, attempt_number = await asyncio.to_thread(_db_create_prescription_image,
+            session_id=session_id,
+            image_bytes=raw,
+            width=int(image.shape[1]),
+            height=int(image.shape[0]),
+            file_path=str(stored_path),
+        )
+    except ValueError as exc:
+        if stored_path:
+            stored_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        if stored_path:
+            stored_path.unlink(missing_ok=True)
+        logger.error("file upload failed (session_id=%s): %s", session_id, exc)
+        raise HTTPException(status_code=503, detail="file upload failed") from exc
+
+    validation = await _validate_image_quality(image, image_id=image_id)
+    if not validation["is_usable"]:
+        raise HTTPException(status_code=422, detail={
+            "status": "rejected",
+            "image_id": image_id,
+            "attempt_number": attempt_number,
+            **validation,
+        })
+    return {
+        "status": "created",
+        "image_id": image_id,
+        "attempt_number": attempt_number,
+        "content_type": file.content_type,
+        "size_bytes": len(raw),
+    }
+
+
+@router.get("/files/{image_id}")
+def retrieve_file(image_id: str):
+    if not _DB_AVAILABLE:
+        raise HTTPException(status_code=503, detail="database unavailable")
+    try:
+        uuid.UUID(image_id)
+        stored_path = _db_get_prescription_image_path(image_id=image_id)
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(status_code=400, detail="image_id must be a valid UUID")
+    except Exception as exc:
+        logger.error("file lookup failed (image_id=%s): %s", image_id, exc)
+        raise HTTPException(status_code=503, detail="database lookup failed") from exc
+    if not stored_path:
+        raise HTTPException(status_code=404, detail="file is not available")
+    path = Path(stored_path).resolve()
+    try:
+        path.relative_to(_STORAGE_ROOT)
+    except ValueError:
+        logger.error("refusing file path outside storage root (image_id=%s)", image_id)
+        raise HTTPException(status_code=500, detail="stored file path is invalid")
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="file is not available")
+    return FileResponse(path)
+
+
+@router.post("/validate-upload")
+async def validate_upload(file: UploadFile = File(...)):
+    """Check a crop without storing an image or counting a capture attempt."""
+    _, image, _ = await _read_validated_image(file)
+    return await _validate_image_quality(image)
+
+
+async def _validate_image_quality(
+    img: np.ndarray, *, image_id: str | None = None,
+    t_start: float | None = None,
+):
+    if t_start is None:
+        t_start = time.perf_counter()
+    lighting = await asyncio.to_thread(_img_proc.check_lighting, img)
+    if lighting == "good":
+        lighting = await asyncio.to_thread(_img_proc.check_lighting_cnr, img)
+
+    blur     = await asyncio.to_thread(_img_proc.check_blur, img)
+    quad     = await asyncio.to_thread(_img_proc.find_paper_quad, img, min_coverage=0.06)
+    img_area = img.shape[0] * img.shape[1]
+
+    framing           = "not_found"
+    doc_quad_response = None
+    if quad is not None:
+        coverage = await asyncio.to_thread(cv2.contourArea, quad) / img_area
+        framing  = "aligned" if coverage >= 0.10 else "too_small"
+        if framing == "aligned":
+            h_img, w_img = img.shape[:2]
+            ordered      = await asyncio.to_thread(_img_proc._order_points, quad)
+            doc_quad_response = {
+                "top_left":     {"x": float(ordered[0][0] / w_img), "y": float(ordered[0][1] / h_img)},
+                "top_right":    {"x": float(ordered[1][0] / w_img), "y": float(ordered[1][1] / h_img)},
+                "bottom_right": {"x": float(ordered[2][0] / w_img), "y": float(ordered[2][1] / h_img)},
+                "bottom_left":  {"x": float(ordered[3][0] / w_img), "y": float(ordered[3][1] / h_img)},
+            }
+
+    quality_score = await asyncio.to_thread(_img_proc._fast_readability_score, img)
+    hw = await asyncio.to_thread(_img_proc.detect_handwriting, img)
+    text_type = "handwritten" if hw["is_handwritten"] else "printed"
+
+    effective_threshold = 55
+    if hw["is_handwritten"] and hw["confidence"] >= 0.7:
+        quality_score = min(quality_score + 8, 100)
+        effective_threshold = 50
+    elif text_type == "printed":
+        effective_threshold = 65
+
+    quality_ok = quality_score >= effective_threshold
+
+    if lighting == "too_dark":
+        msg = "Too dark — move to a brighter spot."
+    elif lighting == "too_bright":
+        msg = "Too bright — tilt slightly to reduce glare."
+    elif blur == "blurry":
+        msg = "Hold still a moment…"
+    elif not quality_ok:
+        msg = "Text not clear enough — adjust framing and hold still."
+    elif framing == "too_small":
+        msg = "Move a little closer to keep the prescription in frame."
+    else:
+        msg = "Looks good — tap capture!"
+
+    is_usable = (lighting == "good" and blur == "sharp" and quality_ok)
+    rejection_reason = (
+        None if is_usable
+        else "lighting" if lighting != "good"
+        else "blur" if blur != "sharp"
+        else "readability"
+    )
+
+    # ── Compute metrics for DB ─────────────────────────────────────────────────
+    _gray_m    = await asyncio.to_thread(cv2.cvtColor, img, cv2.COLOR_BGR2GRAY)
+    _cy, _cx   = _gray_m.shape[0] // 2, _gray_m.shape[1] // 2
+    _roi_m     = _gray_m[int(_cy * 0.3): int(_cy * 1.7), int(_cx * 0.3): int(_cx * 1.7)]
+    _mean_v    = float(np.mean(_roi_m))
+    _std_v     = float(np.std(_roi_m))
+    _blown_pct = float(np.sum(_roi_m > 248)) / _roi_m.size * 100.0
+    _dark_pct  = float(np.sum(_roi_m < 30))  / _roi_m.size * 100.0
+    _cnr       = _mean_v / _std_v if _std_v > 0.5 else 0.0
+    _laplacian = await asyncio.to_thread(cv2.Laplacian, _gray_m, cv2.CV_64F)
+    _lap_var   = float(_laplacian.var())
+
+    if quad is not None:
+        _h_img, _w_img = img.shape[:2]
+        _ord         = await asyncio.to_thread(_img_proc._order_points, quad)
+        _db_area_pct = await asyncio.to_thread(cv2.contourArea, quad) / img_area * 100.0
+        _db_detected = True
+        _db_tl_x, _db_tl_y = float(_ord[0][0] / _w_img), float(_ord[0][1] / _h_img)
+        _db_tr_x, _db_tr_y = float(_ord[1][0] / _w_img), float(_ord[1][1] / _h_img)
+        _db_br_x, _db_br_y = float(_ord[2][0] / _w_img), float(_ord[2][1] / _h_img)
+        _db_bl_x, _db_bl_y = float(_ord[3][0] / _w_img), float(_ord[3][1] / _h_img)
+    else:
+        _db_area_pct = 0.0
+        _db_detected = False
+        _db_tl_x = _db_tl_y = _db_tr_x = _db_tr_y = 0.0
+        _db_br_x = _db_br_y = _db_bl_x = _db_bl_y = 0.0
+
+    _elapsed_ms = round((time.perf_counter() - t_start) * 1000, 1)
+
+    if _DB_AVAILABLE and image_id:
+        try:
+            await asyncio.to_thread(_db_log_validate_capture,
+                image_id=image_id,
+                quality_score=quality_score,
+                blur_score=_lap_var,
+                is_usable=is_usable,
+                processing_time_ms=_elapsed_ms,
+                detection_mode=framing,
+                lighting_condition=lighting,
+                mean_brightness=_mean_v,
+                contrast_ratio=_cnr,
+                blown_pixels_percent=_blown_pct,
+                dark_pixels_percent=_dark_pct,
+                lighting_feedback=msg,
+                document_detected=_db_detected,
+                top_left_x=_db_tl_x,
+                top_left_y=_db_tl_y,
+                top_right_x=_db_tr_x,
+                top_right_y=_db_tr_y,
+                bottom_right_x=_db_br_x,
+                bottom_right_y=_db_br_y,
+                bottom_left_x=_db_bl_x,
+                bottom_left_y=_db_bl_y,
+                document_area_percent=_db_area_pct,
+                framing_status=framing,
+            )
+        except Exception as _e:
+            print(f"[db] validate-capture log failed: {_e}")
+
+    return {
+        "is_usable": is_usable,
+        "rejection_reason": rejection_reason,
+        "feedback":  {"lighting": lighting, "blur": blur, "framing": framing},
+        "instruction": msg,
+        "quality_score": quality_score,
+        "document_quad": doc_quad_response,
+    }
+
+
+
 @router.post("/preview-check")
 async def preview_check(file: UploadFile = File(...)):
-    raw = await file.read()
-    img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
+    raw, img, suffix = await _read_validated_image(file)
     if img is None:
         return {"readable": False, "score": 0, "instruction": "Camera error — please retry."}
 
-    lighting = _img_proc.check_lighting(img)
+    lighting = await asyncio.to_thread(_img_proc.check_lighting, img)
     if lighting == "good":
-        lighting = _img_proc.check_lighting_cnr(img)
+        lighting = await asyncio.to_thread(_img_proc.check_lighting_cnr, img)
 
     if lighting == "too_dark":
         return {"readable": False, "score": 0,
@@ -665,13 +894,13 @@ async def preview_check(file: UploadFile = File(...)):
         return {"readable": False, "score": 0,
                 "instruction": "Too bright — tilt slightly to reduce glare."}
 
-    blur = _img_proc.check_blur(img)
+    blur = await asyncio.to_thread(_img_proc.check_blur, img)
     if blur == "blurry":
         return {"readable": False, "score": 0,
                 "instruction": "Hold still — text is blurry."}
 
-    score     = _img_proc._fast_readability_score(img)
-    hw        = _img_proc.detect_handwriting(img)
+    score     = await asyncio.to_thread(_img_proc._fast_readability_score, img)
+    hw        = await asyncio.to_thread(_img_proc.detect_handwriting, img)
     text_type = "handwritten" if hw["is_handwritten"] else "printed"
 
     effective_threshold = 55
@@ -737,16 +966,20 @@ async def create_capture_image(
     if not _DB_AVAILABLE:
         raise HTTPException(status_code=503, detail="database unavailable")
 
-    raw = await file.read()
-    img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
+    raw, img, suffix = await _read_validated_image(file)
     if img is None:
         return {"status": "error", "reason": "invalid_image"}
 
     height, width = img.shape[:2]
+    stored_path = None
     try:
-        image_id, attempt_number = _db_create_prescription_image(
+        _STORAGE_ROOT.mkdir(parents=True, exist_ok=True)
+        stored_path = _STORAGE_ROOT / f"{uuid.uuid4()}{suffix}"
+        stored_path.write_bytes(raw)
+        image_id, attempt_number = await asyncio.to_thread(_db_create_prescription_image,
             session_id=session_id,
             image_bytes=raw,
+            file_path=str(stored_path),
             width=width,
             height=height,
             exposure_time=exposure_time,
@@ -755,6 +988,8 @@ async def create_capture_image(
         )
         return {"status": "created", "image_id": image_id, "attempt_number": attempt_number}
     except Exception as exc:
+        if stored_path:
+            stored_path.unlink(missing_ok=True)
         logger.error("capture-image creation failed (session_id=%s): %s", session_id, exc)
         raise HTTPException(status_code=503, detail="capture image creation failed")
 
@@ -791,7 +1026,7 @@ async def validate_capture(
         except (ValueError, TypeError, AttributeError):
             raise HTTPException(status_code=400, detail="image_id must be a valid UUID")
         try:
-            if not _db_prescription_image_exists(image_id=image_id):
+            if not await asyncio.to_thread(_db_prescription_image_exists, image_id=image_id):
                 raise HTTPException(status_code=404, detail="image_id was not found")
         except HTTPException:
             raise
@@ -800,7 +1035,7 @@ async def validate_capture(
             raise HTTPException(status_code=503, detail="database lookup failed")
 
     t_start = time.perf_counter()
-    img = cv2.imdecode(np.frombuffer(await file.read(), np.uint8), cv2.IMREAD_COLOR)
+    raw, img, suffix = await _read_validated_image(file)
     if img is None:
         return {
             "is_usable": False,
@@ -810,129 +1045,7 @@ async def validate_capture(
             "feedback": {"lighting": "unknown", "blur": "unknown", "framing": "unknown"},
         }
 
-    lighting = _img_proc.check_lighting(img)
-    if lighting == "good":
-        lighting = _img_proc.check_lighting_cnr(img)
-
-    blur     = _img_proc.check_blur(img)
-    quad     = _img_proc.find_paper_quad(img, min_coverage=0.06)
-    img_area = img.shape[0] * img.shape[1]
-
-    framing           = "not_found"
-    doc_quad_response = None
-    if quad is not None:
-        coverage = cv2.contourArea(quad) / img_area
-        framing  = "aligned" if coverage >= 0.10 else "too_small"
-        if framing == "aligned":
-            h_img, w_img = img.shape[:2]
-            ordered      = _img_proc._order_points(quad)
-            doc_quad_response = {
-                "top_left":     {"x": float(ordered[0][0] / w_img), "y": float(ordered[0][1] / h_img)},
-                "top_right":    {"x": float(ordered[1][0] / w_img), "y": float(ordered[1][1] / h_img)},
-                "bottom_right": {"x": float(ordered[2][0] / w_img), "y": float(ordered[2][1] / h_img)},
-                "bottom_left":  {"x": float(ordered[3][0] / w_img), "y": float(ordered[3][1] / h_img)},
-            }
-
-    quality_score = _img_proc._fast_readability_score(img)
-    hw = _img_proc.detect_handwriting(img)
-    text_type = "handwritten" if hw["is_handwritten"] else "printed"
-
-    effective_threshold = 55
-    if hw["is_handwritten"] and hw["confidence"] >= 0.7:
-        quality_score = min(quality_score + 8, 100)
-        effective_threshold = 50
-    elif text_type == "printed":
-        effective_threshold = 65
-
-    quality_ok = quality_score >= effective_threshold
-
-    if lighting == "too_dark":
-        msg = "Too dark — move to a brighter spot."
-    elif lighting == "too_bright":
-        msg = "Too bright — tilt slightly to reduce glare."
-    elif blur == "blurry":
-        msg = "Hold still a moment…"
-    elif not quality_ok:
-        msg = "Text not clear enough — adjust framing and hold still."
-    elif framing == "too_small":
-        msg = "Move a little closer to keep the prescription in frame."
-    else:
-        msg = "Looks good — tap capture!"
-
-    is_usable = (lighting == "good" and blur == "sharp" and quality_ok)
-    rejection_reason = (
-        None if is_usable
-        else "lighting" if lighting != "good"
-        else "blur" if blur != "sharp"
-        else "readability"
-    )
-
-    # ── Compute metrics for DB ─────────────────────────────────────────────────
-    _gray_m    = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    _cy, _cx   = _gray_m.shape[0] // 2, _gray_m.shape[1] // 2
-    _roi_m     = _gray_m[int(_cy * 0.3): int(_cy * 1.7), int(_cx * 0.3): int(_cx * 1.7)]
-    _mean_v    = float(np.mean(_roi_m))
-    _std_v     = float(np.std(_roi_m))
-    _blown_pct = float(np.sum(_roi_m > 248)) / _roi_m.size * 100.0
-    _dark_pct  = float(np.sum(_roi_m < 30))  / _roi_m.size * 100.0
-    _cnr       = _mean_v / _std_v if _std_v > 0.5 else 0.0
-    _lap_var   = float(cv2.Laplacian(_gray_m, cv2.CV_64F).var())
-
-    if quad is not None:
-        _h_img, _w_img = img.shape[:2]
-        _ord         = _img_proc._order_points(quad)
-        _db_area_pct = cv2.contourArea(quad) / img_area * 100.0
-        _db_detected = True
-        _db_tl_x, _db_tl_y = float(_ord[0][0] / _w_img), float(_ord[0][1] / _h_img)
-        _db_tr_x, _db_tr_y = float(_ord[1][0] / _w_img), float(_ord[1][1] / _h_img)
-        _db_br_x, _db_br_y = float(_ord[2][0] / _w_img), float(_ord[2][1] / _h_img)
-        _db_bl_x, _db_bl_y = float(_ord[3][0] / _w_img), float(_ord[3][1] / _h_img)
-    else:
-        _db_area_pct = 0.0
-        _db_detected = False
-        _db_tl_x = _db_tl_y = _db_tr_x = _db_tr_y = 0.0
-        _db_br_x = _db_br_y = _db_bl_x = _db_bl_y = 0.0
-
-    _elapsed_ms = round((time.perf_counter() - t_start) * 1000, 1)
-
-    if _DB_AVAILABLE:
-        try:
-            _db_log_validate_capture(
-                image_id=image_id,
-                quality_score=quality_score,
-                blur_score=_lap_var,
-                is_usable=is_usable,
-                processing_time_ms=_elapsed_ms,
-                detection_mode=framing,
-                lighting_condition=lighting,
-                mean_brightness=_mean_v,
-                contrast_ratio=_cnr,
-                blown_pixels_percent=_blown_pct,
-                dark_pixels_percent=_dark_pct,
-                lighting_feedback=msg,
-                document_detected=_db_detected,
-                top_left_x=_db_tl_x,
-                top_left_y=_db_tl_y,
-                top_right_x=_db_tr_x,
-                top_right_y=_db_tr_y,
-                bottom_right_x=_db_br_x,
-                bottom_right_y=_db_br_y,
-                bottom_left_x=_db_bl_x,
-                bottom_left_y=_db_bl_y,
-                document_area_percent=_db_area_pct,
-                framing_status=framing,
-            )
-        except Exception as _e:
-            print(f"[db] validate-capture log failed: {_e}")
-
-    return {
-        "is_usable": is_usable,
-        "rejection_reason": rejection_reason,
-        "feedback":  {"lighting": lighting, "blur": blur, "framing": framing},
-        "instruction": msg,
-        "quality_score": quality_score,
-        "document_quad": doc_quad_response,
-    }
+    return await _validate_image_quality(img, image_id=image_id, t_start=t_start)
 
 
 @router.post("/process-image")
@@ -985,14 +1098,13 @@ async def process_image(
 
     t_start = time.perf_counter()
     preprocessing_started_at = datetime.now(timezone.utc)
-    raw     = await file.read()
+    raw, img, suffix = await _read_validated_image(file)
     if image_id and _DB_AVAILABLE and not skip_persistence:
         try:
             _db_update_image_status(image_id=image_id, status="processing")
         except Exception as exc:
             print(f"[db] image processing status update failed: {exc}")
 
-    img     = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
     if img is None:
         if image_id and _DB_AVAILABLE and not skip_persistence:
             _db_update_image_status(image_id=image_id, status="failed")

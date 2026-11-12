@@ -95,6 +95,7 @@ class DatabaseService:
         image_bytes: bytes,
         width: int,
         height: int,
+        file_path: str | None = None,
         exposure_time: float | None = None,
         iso_sensitivity: int | None = None,
         focal_length: float | None = None,
@@ -134,7 +135,7 @@ class DatabaseService:
                     RETURNING image_id
                     """,
                     (
-                        session_id, None, checksum, width, height,
+                        session_id, file_path, checksum, width, height,
                         exposure_time, iso_sensitivity, focal_length,
                         "captured", attempt_number,
                     ),
@@ -153,6 +154,20 @@ class DatabaseService:
                         f"capture session {session_id} update affected {cur.rowcount} rows"
                     )
                 return image_id, attempt_number
+
+    def get_prescription_image_path(self, *, image_id: str) -> str | None:
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT file_path
+                    FROM "PRESCRIPTION_IMAGE"
+                    WHERE image_id = %s
+                    """,
+                    (image_id,),
+                )
+                row = cur.fetchone()
+                return str(row[0]) if row and row[0] else None
 
     def update_prescription_image_status(self, *, image_id: str, status: str) -> None:
         with self._get_conn() as conn:
@@ -730,6 +745,7 @@ fetch_drug_catalog = _db_service.fetch_drug_catalog
 log_validate_capture = _db_service.log_validate_capture
 create_capture_session = _db_service.create_capture_session
 create_prescription_image = _db_service.create_prescription_image
+get_prescription_image_path = _db_service.get_prescription_image_path
 update_prescription_image_status = _db_service.update_prescription_image_status
 prescription_image_exists = _db_service.prescription_image_exists
 has_completed_transcription_result = _db_service.has_completed_transcription_result

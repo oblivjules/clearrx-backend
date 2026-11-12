@@ -24,6 +24,7 @@ hf_cache/
 *.pth
 
 # Local data, databases, and logs
+CleaRx-backend/storage/
 *.db
 *.sqlite
 *.sqlite3
